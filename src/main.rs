@@ -154,13 +154,14 @@ async fn run(
             open_play_folder(&folder, open).await?;
         }
         Action::Delete { target, yes } => {
+            let by_position = matches!(&target, Some(PlaygroundTarget::Position(_)));
             Playground::open(home, false)
                 .await?
                 .delete(target, |record, is_current| {
                     if yes {
                         Ok(true)
                     } else {
-                        confirm_delete(record, is_current)
+                        confirm_delete(record, is_current, by_position)
                     }
                 })
                 .await?;
@@ -183,7 +184,7 @@ async fn run(
     Ok(())
 }
 
-fn confirm_delete(record: &PlaygroundRecord, is_current: bool) -> Result<bool> {
+fn confirm_delete(record: &PlaygroundRecord, is_current: bool, by_position: bool) -> Result<bool> {
     let stdin = io::stdin();
     ensure!(
         stdin.is_terminal(),
@@ -193,17 +194,26 @@ fn confirm_delete(record: &PlaygroundRecord, is_current: bool) -> Result<bool> {
     let mut stderr = io::stderr().lock();
     writeln!(
         stderr,
-        "将永久删除游乐场 {:?} ({})。",
+        "- 将永久删除游乐场 {:?} ({})。",
         record.name, record.id
     )?;
+
     if is_current {
         writeln!(
             stderr,
-            "当前 play 目录中的所有内容都会被删除，包括未提交和被 Git 忽略的文件。"
+            "- 当前 play 目录中的所有内容都会被删除，包括未提交和被 Git 忽略的文件。"
         )?;
     }
+
     if record.archived_path.is_some() {
-        writeln!(stderr, "对应的 Git Bundle 也会被删除。")?;
+        writeln!(stderr, "- 对应的 Git Bundle 也会被删除。")?;
+    }
+
+    if by_position {
+        writeln!(
+            stderr,
+            "\n- **注意**：删除游乐场后其他游乐场的序号可能会发生改变，连续使用序号删除时请务必检查！\n"
+        )?;
     }
     write!(stderr, "确认删除？[y/N] ")?;
     stderr.flush()?;
