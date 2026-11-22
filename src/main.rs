@@ -2,7 +2,7 @@ mod config;
 mod editor;
 mod repository;
 
-use std::{env, path::Path, process::ExitCode};
+use std::{env, ffi::OsString, path::Path, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use jiff::{Timestamp, Zoned};
@@ -25,6 +25,8 @@ enum Action {
         #[arg(short = 'd', long, value_name = "依赖", num_args = 1..)]
         deps: Vec<String>,
     },
+    /// 打开当前试验文件夹
+    Open,
     /// 提交当前试验的改动
     Backup,
 }
@@ -33,12 +35,12 @@ type Result<T> = std::result::Result<T, String>;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = Repository::open(
+    let result = run(
+        cli.command,
         env::var_os("CARGOPLAY_HOME"),
-        matches!(&cli.command, Action::Init | Action::New { .. }),
         config::prepare_global,
-    )
-    .and_then(|repo| run(cli.command, repo, editor::open_folder));
+        editor::open_folder,
+    );
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -52,16 +54,32 @@ fn default_branch_name(now: &Zoned) -> String {
     now.strftime("play/new-%Y%m%d-%H%M%S").to_string()
 }
 
-fn run(action: Action, repo: Repository, open: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-    let now = Timestamp::now();
-    let timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
+fn run(
+    action: Action,
+    home: Option<OsString>,
+    prepare_config: impl FnOnce(&Path, bool) -> Result<()>,
+    open: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let timestamp = || Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let repo = |home, create| Repository::open(home, create, prepare_config);
     match action {
-        Action::Init => println!("试验仓库已就绪：{}", repo.root.display()),
+        Action::Init => println!("试验仓库已就绪：{}", repo(home, true)?.root.display()),
+        Action::Open => {
+            let folder = config::resolve_home(home)?.join("play");
+            if !folder.is_dir() {
+                return Err(format!(
+                    "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cargo-play init。",
+                    folder.display()
+                ));
+            }
+            open_with_warning(&folder, open);
+        }
         Action::Backup => {
-            repo.backup(&timestamp)?;
+            repo(home, false)?.backup(&timestamp())?;
         }
         Action::New { deps } => {
-            repo.backup(&timestamp)?;
+            let repo = repo(home, true)?;
+            repo.backup(&timestamp())?;
             if repo.has_changes()? {
                 return Err("备份后工作区仍有改动，请运行 git status 检查后重试。".into());
             }
@@ -81,12 +99,16 @@ fn run(action: Action, repo: Repository, open: impl FnOnce(&Path) -> Result<()>)
 
             let folder = repo.root.clone();
             drop(repo);
-            if let Err(error) = open(&folder) {
-                eprintln!("警告：{error}\n请手动打开 {}", folder.display());
-            }
+            open_with_warning(&folder, open);
         }
     }
     Ok(())
+}
+
+fn open_with_warning(folder: &Path, open: impl FnOnce(&Path) -> Result<()>) {
+    if let Err(error) = open(folder) {
+        eprintln!("警告：{error}\n请手动打开 {}", folder.display());
+    }
 }
 
 #[cfg(test)]

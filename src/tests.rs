@@ -83,11 +83,12 @@ impl Fixture {
         action: Action,
         open: impl FnOnce(&Path) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        let repo = open_repo(
+        run(
+            action,
             Some(self.home.clone().into_os_string()),
-            matches!(&action, Action::Init | Action::New { .. }),
-        )?;
-        run(action, repo, open)
+            prepare_config,
+            open,
+        )
     }
 
     fn fail_commits(&self) {
@@ -134,9 +135,11 @@ directory = "vendor"
 }
 
 fn open_repo(home: Option<OsString>, create: bool) -> crate::Result<Repository> {
-    Repository::open(home, create, |home, create| {
-        Config::read(home)?.prepare(home, create)
-    })
+    Repository::open(home, create, prepare_config)
+}
+
+fn prepare_config(home: &Path, create: bool) -> crate::Result<()> {
+    Config::read(home)?.prepare(home, create)
 }
 
 fn new(deps: &[&str]) -> Action {
@@ -151,10 +154,37 @@ fn not_opened(_: &Path) -> crate::Result<()> {
 
 #[test]
 fn parses_cli() {
+    let cli = Cli::try_parse_from(["cargo-play", "open"]).unwrap();
+    assert!(matches!(cli.command, Action::Open));
     assert!(Cli::try_parse_from(["cargo-play", "new", "-d"]).is_err());
     assert!(Cli::try_parse_from(["cargo-play", "backup", "-d", "serde"]).is_err());
     let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde@1", "anyhow"]).unwrap();
     assert!(matches!(cli.command, Action::New { deps } if deps == ["serde@1", "anyhow"]));
+}
+
+#[test]
+fn opens_existing_folder_directly() {
+    let fixture = Fixture::empty();
+    fs::create_dir(&fixture.play).unwrap();
+    let mut opened = false;
+    fixture
+        .run(Action::Open, |path| {
+            assert_eq!(path, fixture.play);
+            opened = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(opened);
+    assert!(fs::read_dir(&fixture.play).unwrap().next().is_none());
+    assert!(!fixture.home.join("cargo-play.json").exists());
+}
+
+#[test]
+fn open_requires_an_existing_folder() {
+    let fixture = Fixture::empty();
+    let error = fixture.run(Action::Open, not_opened).unwrap_err();
+    assert!(error.contains("找不到试验文件夹"));
+    assert!(!fixture.play.exists());
 }
 
 #[test]
