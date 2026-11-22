@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     fs,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -12,8 +13,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::{
-    Action, Cli, Playground, default_package_name, list_playgrounds, run,
-    state::{ArchiveRecord, NameMatch, PlaygroundRecord, State},
+    Action, Cli, Playground, ResumeTarget, default_package_name, list_playgrounds, run,
+    state::{NameMatch, PlaygroundRecord, State},
 };
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -269,7 +270,10 @@ fn parses_cli() {
     let cli = Cli::try_parse_from(["cargo-play", "open"]).unwrap();
     assert!(matches!(cli.command, Action::Open));
     let cli = Cli::try_parse_from(["cargo-play", "list"]).unwrap();
-    assert!(matches!(cli.command, Action::List));
+    assert!(matches!(cli.command, Action::List { offset: 0 }));
+    let cli = Cli::try_parse_from(["cargo-play", "list", "--offset", "50"]).unwrap();
+    assert!(matches!(cli.command, Action::List { offset: 50 }));
+    assert!(Cli::try_parse_from(["cargo-play", "list", "--offset", "-1"]).is_err());
     assert!(Cli::try_parse_from(["cargo-play", "new", "-d"]).is_err());
     assert!(Cli::try_parse_from(["cargo-play", "backup", "-d", "serde"]).is_err());
     let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde@1", "anyhow"]).unwrap();
@@ -279,11 +283,29 @@ fn parses_cli() {
     let id = Uuid::new_v4();
     let uuid = id.to_string();
     let cli = Cli::try_parse_from(["cargo-play", "resume", &uuid]).unwrap();
-    assert!(matches!(cli.command, Action::Resume { id: parsed, force: false } if parsed == id));
-    assert!(Cli::try_parse_from(["cargo-play", "resume", "not-a-uuid"]).is_err());
+    assert!(
+        matches!(cli.command, Action::Resume { target: ResumeTarget::Id(parsed), force: false } if parsed == id)
+    );
+    let cli = Cli::try_parse_from(["cargo-play", "resume", "10000", "--force"]).unwrap();
+    assert!(
+        matches!(cli.command, Action::Resume { target: ResumeTarget::Position(position), force: true } if position.get() == 10000)
+    );
+    let cli =
+        Cli::try_parse_from(["cargo-play", "resume", "00000000000000000000000000000001"]).unwrap();
+    assert!(
+        matches!(cli.command, Action::Resume { target: ResumeTarget::Id(id), .. } if id == Uuid::from_u128(1))
+    );
+    for invalid in ["0", "-1", "1.5", "18446744073709551616", "not-a-uuid"] {
+        assert!(
+            Cli::try_parse_from(["cargo-play", "resume", invalid]).is_err(),
+            "{invalid}"
+        );
+    }
     for flag in ["-f", "--force"] {
         let cli = Cli::try_parse_from(["cargo-play", "resume", &uuid, flag]).unwrap();
-        assert!(matches!(cli.command, Action::Resume { id: parsed, force: true } if parsed == id));
+        assert!(
+            matches!(cli.command, Action::Resume { target: ResumeTarget::Id(parsed), force: true } if parsed == id)
+        );
         let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde", flag]).unwrap();
         assert!(
             matches!(cli.command, Action::New { deps, name: None, force: true } if deps == ["serde"])
@@ -300,69 +322,124 @@ fn table_rows(table: &str) -> Vec<Vec<&str>> {
 }
 
 #[test]
-fn lists_current_then_archives_by_timestamp_and_uuid() {
+fn lists_all_playgrounds_by_visit_time_and_uuid() {
     let fixture = Fixture::empty();
     let latest = Uuid::from_u128(4);
+    let fraction = Uuid::from_u128(6);
     let tied_first = Uuid::from_u128(2);
     let tied_second = Uuid::from_u128(3);
     let oldest = Uuid::from_u128(1);
     let current = Uuid::from_u128(5);
     let table = block_on(async {
         let state = State::open(&fixture.home).await.unwrap();
-        let mut previous = None;
-        for (id, name, timestamp) in [
-            (tied_second, "重名", "2025-02-02T18:04:05Z"),
-            (latest, "重名", "2025-02-02T18:04:05.9Z"),
-            (oldest, "旧试验", "2025-02-01T18:04:05Z"),
-            (tied_first, "Rust", "2025-02-02T18:04:05Z"),
+        for (id, name, timestamp, archived_path) in [
+            (
+                tied_second,
+                "重名",
+                "2025-02-02T18:04:05Z",
+                Some("history/three.bundle"),
+            ),
+            (
+                latest,
+                "重名",
+                "2025-02-02T18:04:06Z",
+                Some("history/four.bundle"),
+            ),
+            (
+                fraction,
+                "亚秒",
+                "2025-02-02T18:04:05.000000001Z",
+                Some("history/six.bundle"),
+            ),
+            (
+                oldest,
+                "旧试验",
+                "2025-02-01T18:04:05Z",
+                Some("history/one.bundle"),
+            ),
+            (
+                tied_first,
+                "Rust",
+                "2025-02-02T18:04:05Z",
+                Some("history/two.bundle"),
+            ),
+            (current, "当前项目\n\x1b", "2025-02-02T18:04:05.5Z", None),
         ] {
-            state
-                .stage_switch(id, name, previous.as_ref())
-                .await
-                .unwrap()
-                .commit()
-                .await
-                .unwrap();
-            previous = Some(ArchiveRecord {
-                id,
-                path: format!("history/{id}.bundle"),
-                timestamp: timestamp.into(),
-            });
+            state.connection().execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO playgrounds (id, name, last_visit_time, archived_path) VALUES (?, ?, ?, ?)",
+                [id.into(), name.into(), timestamp.into(), archived_path.into()],
+            )).await.unwrap();
         }
         state
-            .stage_switch(current, "当前项目\n\x1b", previous.as_ref())
-            .await
-            .unwrap()
-            .commit()
+            .connection()
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO current_playground (slot, playground_id) VALUES (1, ?)",
+                [current.into()],
+            ))
             .await
             .unwrap();
         let before = fs::read(fixture.home.join("workspace.sqlite3")).unwrap();
         let time_zone = tz::offset(8).to_time_zone();
-        let table = list_playgrounds(&fixture.home, &time_zone).await.unwrap();
+        let table = list_playgrounds(&fixture.home, &time_zone, 0)
+            .await
+            .unwrap();
         assert_eq!(
             fs::read(fixture.home.join("workspace.sqlite3")).unwrap(),
             before
         );
         assert!(!fixture.home.join(".cargo-play.lock").exists());
+        for (index, id) in [latest, current, fraction, tied_first, tied_second, oldest]
+            .into_iter()
+            .enumerate()
+        {
+            let position = NonZeroU64::new(index as u64 + 1).unwrap();
+            assert_eq!(state.id_at_position(position).await.unwrap(), Some(id));
+        }
+        assert_eq!(State::list(&fixture.home, 1).await.unwrap()[0].id, current);
         table
     });
     assert_eq!(
         table_rows(&table),
         [
-            ["名称", "ID", "日期"],
-            [r"当前项目\n\u{1b}", &current.to_string(), "当前"],
-            ["重名", &latest.to_string(), "2025-02-03 02:04:05 +08:00"],
+            ["序号", "名称", "ID", "上次访问"],
             [
+                "1",
+                "重名",
+                &latest.to_string(),
+                "2025-02-03 02:04:06 +08:00"
+            ],
+            [
+                "2",
+                r"当前项目\n\u{1b}",
+                &current.to_string(),
+                "2025-02-03 02:04:05 +08:00"
+            ],
+            [
+                "3",
+                "亚秒",
+                &fraction.to_string(),
+                "2025-02-03 02:04:05 +08:00"
+            ],
+            [
+                "4",
                 "Rust",
                 &tied_first.to_string(),
                 "2025-02-03 02:04:05 +08:00"
             ],
             [
+                "5",
                 "重名",
                 &tied_second.to_string(),
                 "2025-02-03 02:04:05 +08:00"
             ],
-            ["旧试验", &oldest.to_string(), "2025-02-02 02:04:05 +08:00"],
+            [
+                "6",
+                "旧试验",
+                &oldest.to_string(),
+                "2025-02-02 02:04:05 +08:00"
+            ],
         ]
     );
     assert!(!table.contains('\x1b'));
@@ -373,37 +450,39 @@ fn lists_only_headers_for_an_empty_database() {
     let fixture = Fixture::empty();
     let table = block_on(async {
         State::open(&fixture.home).await.unwrap();
-        list_playgrounds(&fixture.home, &tz::TimeZone::UTC)
+        list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 0)
             .await
             .unwrap()
     });
-    assert_eq!(table_rows(&table), [["名称", "ID", "日期"]]);
+    assert_eq!(table_rows(&table), [["序号", "名称", "ID", "上次访问"]]);
 }
 
 #[test]
 fn list_requires_initialization_without_creating_state() {
     let fixture = Fixture::empty();
-    let error = fixture.run(Action::List, not_opened).unwrap_err();
+    let error = fixture
+        .run(Action::List { offset: 0 }, not_opened)
+        .unwrap_err();
     assert!(error.to_string().contains("cargo-play init"));
     assert_eq!(fs::read_dir(&fixture.home).unwrap().count(), 1);
 }
 
 #[test]
-fn list_reports_the_id_with_an_invalid_archive_timestamp() {
+fn list_reports_the_id_with_an_invalid_visit_timestamp() {
     let fixture = Fixture::empty();
     let id = Uuid::from_u128(1);
     let error = block_on(async {
         let state = State::open(&fixture.home).await.unwrap();
         state.connection().execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO playgrounds (id, name, archived_path, archived_at) VALUES (?, '测试', 'history/old.bundle', 'invalid')",
+            "INSERT INTO playgrounds (id, name, archived_path, last_visit_time) VALUES (?, '测试', 'history/old.bundle', 'invalid')",
             [id.into()],
         )).await.unwrap();
-        list_playgrounds(&fixture.home, &tz::TimeZone::UTC)
+        list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 0)
             .await
             .unwrap_err()
     });
-    assert!(error.to_string().contains("归档时间无效"));
+    assert!(error.to_string().contains("上次访问时间无效"));
     assert!(error.to_string().contains(&id.to_string()));
 }
 
@@ -627,10 +706,10 @@ fn new_archives_git_history_and_keeps_the_registered_name() {
     assert_eq!(fixture.lookup("old-trial"), NameMatch::Unique(id));
     let entry = fixture.record(id);
     assert_eq!(entry.archived_path.unwrap(), format!("history/{id}.bundle"));
-    let timestamp = entry.archived_at.as_deref().unwrap();
+    let timestamp = &entry.last_visit_time;
     assert_eq!(
         timestamp.parse::<Timestamp>().unwrap().to_string(),
-        timestamp
+        *timestamp
     );
     let bundle = fixture.archive_at("old-trial");
     fixture.git_at(
@@ -696,7 +775,7 @@ fn explicit_utf8_names_are_preserved_and_duplicate_names_require_ids() {
     let first = fixture.active();
     assert_eq!(first.id.get_version_num(), 4);
     assert_eq!(first.name, name);
-    assert!(first.archived_at.is_none());
+    assert!(first.last_visit_time.parse::<Timestamp>().is_ok());
     assert!(first.archived_path.is_none());
     assert_eq!(fixture.lookup(name), NameMatch::Unique(first.id));
     assert_eq!(fixture.lookup(&format!("{name} ")), NameMatch::Missing);
@@ -778,7 +857,7 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
             .connection()
             .execute(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "UPDATE playgrounds SET archived_path = ?, archived_at = ? WHERE id = ?",
+                "UPDATE playgrounds SET archived_path = ?, last_visit_time = ? WHERE id = ?",
                 [
                     format!("history/{id}.bundle").into(),
                     "2026-01-01T00:00:00Z".into(),
@@ -821,7 +900,7 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
     fixture.run(new(&[]), |_| Ok(())).unwrap();
     let updated = fixture.record(id);
     assert_eq!(updated.archived_path, record.archived_path);
-    assert_ne!(updated.archived_at, record.archived_at);
+    assert_eq!(updated.last_visit_time, record.last_visit_time);
     assert_ne!(fs::read(&bundle).unwrap(), bytes);
     assert_eq!(
         fs::read_dir(fixture.home.join("history")).unwrap().count(),
@@ -846,16 +925,18 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     fixture.run(new(&[]), |_| Ok(())).unwrap();
     let other = fixture.active();
     let original_archive = fixture.record(original.id);
+    assert_eq!(original_archive.last_visit_time, original.last_visit_time);
     let original_bundle = fixture
         .home
         .join(original_archive.archived_path.as_ref().unwrap());
     let bundle_contents = fs::read(&original_bundle).unwrap();
     fs::write(fixture.play.join("draft.txt"), "other project changes").unwrap();
 
+    let before_resume = Timestamp::now();
     fixture
         .run(
             Action::Resume {
-                id: original.id,
+                target: ResumeTarget::Id(original.id),
                 force: true,
             },
             |path| {
@@ -864,7 +945,16 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
             },
         )
         .unwrap();
-    assert_eq!(fixture.active(), original_archive);
+    let resumed = fixture.active();
+    assert_eq!(resumed.id, original_archive.id);
+    assert_eq!(resumed.name, original_archive.name);
+    assert_eq!(resumed.archived_path, original_archive.archived_path);
+    let last_visit = resumed.last_visit_time.parse::<Timestamp>().unwrap();
+    assert!((before_resume..=Timestamp::now()).contains(&last_visit));
+    assert_eq!(
+        fixture.record(other.id).last_visit_time,
+        other.last_visit_time
+    );
     assert_eq!(fixture.git(&["branch", "--show-current"]), "experiment");
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), original_head);
     assert_eq!(fs::read(&original_bundle).unwrap(), bundle_contents);
@@ -872,18 +962,29 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
         fs::read_to_string(fixture.play.join(".git/cargo-play.bundle-worktree")).unwrap(),
         format!("{}\n", original.id)
     );
-    let table = block_on(list_playgrounds(&fixture.home, &tz::TimeZone::UTC)).unwrap();
+    let table = block_on(list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 0)).unwrap();
     assert_eq!(
         table_rows(&table)[1],
-        [original.name.as_str(), &original.id.to_string(), "当前"]
+        [
+            "1",
+            original.name.as_str(),
+            &original.id.to_string(),
+            last_visit
+                .to_zoned(tz::TimeZone::UTC)
+                .strftime("%Y-%m-%d %H:%M:%S %:z")
+                .to_string()
+                .as_str(),
+        ]
     );
+    // The current playground still has archive metadata after a restore.
+    assert_eq!(table_rows(&table).len(), 3);
     assert!(!fixture.play.join("draft.txt").exists());
     fs::write(fixture.play.join("old.txt"), "original project changes").unwrap();
 
     fixture
         .run(
             Action::Resume {
-                id: other.id,
+                target: ResumeTarget::Id(other.id),
                 force: false,
             },
             |_| Ok(()),
@@ -901,7 +1002,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     fixture
         .run(
             Action::Resume {
-                id: original.id,
+                target: ResumeTarget::Id(original.id),
                 force: false,
             },
             |_| Ok(()),
@@ -919,28 +1020,117 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
 }
 
 #[test]
-fn resuming_the_current_uuid_only_opens_the_folder() {
+fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
+    let fixture = Fixture::previous_trial();
+    let original = fixture.active();
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    let current = fixture.active();
+    block_on(async {
+        let state = State::open_existing(&fixture.home).await.unwrap();
+        state
+            .connection()
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE playgrounds SET last_visit_time = '2025-01-01T00:00:00Z' WHERE id = ?",
+                [original.id.into()],
+            ))
+            .await
+            .unwrap();
+        state.connection().execute_unprepared(
+            "WITH RECURSIVE positions(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM positions WHERE n < 10000)
+             INSERT INTO playgrounds (id, name, archived_path, last_visit_time)
+             SELECT CAST(printf('synthetic-%06d', n) AS BLOB), '归档', 'history/example.bundle',
+                    '2025-01-02T00:00:00Z' FROM positions",
+        ).await.unwrap();
+        for offset in [0, 50] {
+            let table = list_playgrounds(&fixture.home, &tz::TimeZone::UTC, offset)
+                .await
+                .unwrap();
+            let rows = table_rows(&table);
+            assert_eq!(rows.len(), 51);
+            assert_eq!(rows[1][0], (offset + 1).to_string());
+            assert_eq!(rows[50][0], (offset + 50).to_string());
+            let first_id = if offset == 0 {
+                current.id
+            } else {
+                Uuid::from_bytes(*b"synthetic-000050")
+            };
+            assert_eq!(rows[1][2], first_id.to_string());
+        }
+        let table = list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 10000)
+            .await
+            .unwrap();
+        let rows = table_rows(&table);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2][0], "10002");
+        assert_eq!(rows[2][2], original.id.to_string());
+        for offset in [10002, u64::MAX] {
+            let table = list_playgrounds(&fixture.home, &tz::TimeZone::UTC, offset)
+                .await
+                .unwrap();
+            assert_eq!(table_rows(&table), [["序号", "名称", "ID", "上次访问"]]);
+        }
+    });
+    for position in ["10003", "18446744073709551615"] {
+        let action = Cli::try_parse_from(["cargo-play", "resume", position])
+            .unwrap()
+            .command;
+        let error = fixture.run(action, not_opened).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("找不到序号为 {position}"))
+        );
+        assert_eq!(fixture.active(), current);
+    }
+    let action = Cli::try_parse_from(["cargo-play", "resume", "10002"])
+        .unwrap()
+        .command;
+    fixture
+        .run(action, |path| {
+            assert_eq!(path, fixture.play);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(fixture.active().id, original.id);
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("old.txt")).unwrap(),
+        "old"
+    );
+}
+
+#[test]
+fn resuming_the_current_playground_updates_its_visit_time_and_opens_it() {
     let fixture = Fixture::previous_trial();
     let active = fixture.active();
     let marker = fixture.play.join(".git/cargo-play.bundle-worktree");
     fs::write(&marker, "invalid marker").unwrap();
     fs::write(fixture.play.join("draft.txt"), "still untracked").unwrap();
-    let mut opened = false;
-    fixture
-        .run(
-            Action::Resume {
-                id: active.id,
-                force: false,
-            },
-            |path| {
-                assert_eq!(path, fixture.play);
-                opened = true;
-                Ok(())
-            },
-        )
-        .unwrap();
-    assert!(opened);
-    assert_eq!(fixture.active(), active);
+    for target in [
+        ResumeTarget::Id(active.id),
+        ResumeTarget::Position(NonZeroU64::MIN),
+    ] {
+        let mut opened = false;
+        let before_resume = Timestamp::now();
+        fixture
+            .run(
+                Action::Resume {
+                    target,
+                    force: false,
+                },
+                |path| {
+                    assert_eq!(path, fixture.play);
+                    opened = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(opened);
+        let record = fixture.active();
+        assert_eq!(record.id, active.id);
+        let last_visit = record.last_visit_time.parse::<Timestamp>().unwrap();
+        assert!((before_resume..=Timestamp::now()).contains(&last_visit));
+    }
     assert_eq!(fs::read_to_string(marker).unwrap(), "invalid marker");
     assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
     fixture.assert_no_archives();
@@ -968,13 +1158,25 @@ fn resume_requires_force_to_discard_an_unregistered_workspace() {
     )
     .unwrap();
     let error = fixture
-        .run(Action::Resume { id, force: false }, not_opened)
+        .run(
+            Action::Resume {
+                target: ResumeTarget::Id(id),
+                force: false,
+            },
+            not_opened,
+        )
         .unwrap_err();
     assert!(error.to_string().contains("cargo-play resume --force"));
     assert!(fixture.play.join("unregistered.txt").is_file());
 
     fixture
-        .run(Action::Resume { id, force: true }, |_| Ok(()))
+        .run(
+            Action::Resume {
+                target: ResumeTarget::Position(NonZeroU64::new(2).unwrap()),
+                force: true,
+            },
+            |_| Ok(()),
+        )
         .unwrap();
     assert_eq!(fixture.active().id, id);
     assert!(!fixture.play.join("unregistered.txt").exists());
@@ -986,7 +1188,13 @@ fn unknown_uuid_does_not_clear_the_current_workspace() {
     let active = fixture.active();
     let id = Uuid::new_v4();
     let error = fixture
-        .run(Action::Resume { id, force: true }, not_opened)
+        .run(
+            Action::Resume {
+                target: ResumeTarget::Id(id),
+                force: true,
+            },
+            not_opened,
+        )
         .unwrap_err();
     assert!(error.to_string().contains(&id.to_string()));
     assert_eq!(fixture.active(), active);
@@ -1000,19 +1208,21 @@ fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
     let target = fixture.active();
     fixture.run(new(&[]), |_| Ok(())).unwrap();
     let previous = fixture.active();
+    let before_resume = fixture.record(target.id);
     fs::write(fixture.archive_at(&target.name), "invalid bundle").unwrap();
     fs::write(fixture.play.join("draft.txt"), "archive before cloning").unwrap();
 
     let error = fixture
         .run(
             Action::Resume {
-                id: target.id,
+                target: ResumeTarget::Id(target.id),
                 force: false,
             },
             not_opened,
         )
         .unwrap_err();
     assert!(format!("{error:#}").contains("git clone"), "{error:#}");
+    assert_eq!(fixture.record(target.id), before_resume);
     block_on(async {
         let state = State::open_existing(&fixture.home).await.unwrap();
         assert!(state.active().await.unwrap().is_none());
@@ -1021,7 +1231,7 @@ fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
     fixture
         .run(
             Action::Resume {
-                id: previous.id,
+                target: ResumeTarget::Id(previous.id),
                 force: false,
             },
             |_| Ok(()),
@@ -1067,7 +1277,10 @@ fn locks_mutating_commands_at_home() {
         Action::Init,
         Action::Backup,
         new(&[]),
-        Action::Resume { id, force: false },
+        Action::Resume {
+            target: ResumeTarget::Id(id),
+            force: false,
+        },
     ] {
         assert!(
             fixture

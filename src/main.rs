@@ -3,13 +3,13 @@ mod editor;
 mod repository;
 mod state;
 
-use std::{env, ffi::OsString, path::Path, process::ExitCode};
+use std::{env, ffi::OsString, path::Path, process::ExitCode, str::FromStr};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 use jiff::{Zoned, tz::TimeZone};
-use repository::{Playground, directory_exists};
+use repository::{Playground, ResumeTarget, directory_exists};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -37,11 +37,11 @@ enum Action {
         #[arg(short, long)]
         force: bool,
     },
-    /// 归档当前试验，按 UUID 恢复游乐场并打开项目文件夹
+    /// 归档当前试验，按序号或 UUID 恢复游乐场并打开项目文件夹
     Resume {
-        /// 游乐场 UUID，可通过 list 查看
-        #[arg(value_name = "UUID")]
-        id: Uuid,
+        /// 从 1 开始的全库序号，或游乐场 UUID，可通过 list 查看
+        #[arg(value_name = "序号或UUID", allow_negative_numbers = true)]
+        target: ResumeTarget,
         /// 允许替换未登记的旧工作区
         #[arg(short, long)]
         force: bool,
@@ -50,8 +50,31 @@ enum Action {
     Open,
     /// 提交当前试验的改动
     Backup,
-    /// 列出当前的游乐场和归档记录，归档记录按时间倒序排列
-    List,
+    /// 按上次访问时间倒序列出游乐场，每次最多显示 50 条
+    List {
+        /// 跳过的游乐场条数
+        #[arg(long, default_value_t = 0, value_name = "条数")]
+        offset: u64,
+    },
+}
+
+impl FromStr for ResumeTarget {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        // Preserve UUID forms without hyphens, which can consist entirely of digits.
+        if let Ok(id) = Uuid::parse_str(value) {
+            return Ok(Self::Id(id));
+        }
+        let digits = value.trim_start_matches(['+', '-']);
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return value
+                .parse()
+                .map(Self::Position)
+                .context("序号必须是正整数");
+        }
+        bail!("请输入游乐场序号（从 1 开始）或 UUID")
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -92,14 +115,14 @@ async fn run(
             open_play_folder(&folder, open).await?;
         }
         Action::Backup => Playground::open(home, false).await?.backup().await?,
-        Action::List => {
+        Action::List { offset } => {
             let home = config::resolve_home(home)?;
-            let table = list_playgrounds(&home, &TimeZone::system()).await?;
+            let table = list_playgrounds(&home, &TimeZone::system(), offset).await?;
             println!("{table}");
         }
-        Action::Resume { id, force } => {
+        Action::Resume { target, force } => {
             let playground = Playground::open(home, false).await?;
-            playground.resume(id, force).await?;
+            playground.resume(target, force).await?;
             let folder = playground.root.clone();
             drop(playground);
             open_play_folder(&folder, open).await?;
@@ -122,13 +145,13 @@ async fn run(
     Ok(())
 }
 
-async fn list_playgrounds(home: &Path, time_zone: &TimeZone) -> Result<String> {
-    let entries = state::State::list(home).await?;
+async fn list_playgrounds(home: &Path, time_zone: &TimeZone, offset: u64) -> Result<String> {
+    let entries = state::State::list(home, offset).await?;
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL_CONDENSED)
-        .set_header(["名称", "ID", "日期"]);
-    for entry in entries {
+        .set_header(["序号", "名称", "ID", "上次访问"]);
+    for (index, entry) in entries.into_iter().enumerate() {
         let mut alias = String::new();
         for ch in entry.name.chars() {
             if ch.is_control() {
@@ -137,14 +160,13 @@ async fn list_playgrounds(home: &Path, time_zone: &TimeZone) -> Result<String> {
                 alias.push(ch);
             }
         }
-        let date = match entry.archived_at {
-            Some(timestamp) => timestamp
-                .to_zoned(time_zone.clone())
-                .strftime("%Y-%m-%d %H:%M:%S %:z")
-                .to_string(),
-            None => "当前".to_owned(),
-        };
-        table.add_row([alias, entry.id.to_string(), date]);
+        let date = entry
+            .last_visit_time
+            .to_zoned(time_zone.clone())
+            .strftime("%Y-%m-%d %H:%M:%S %:z")
+            .to_string();
+        let position = offset + index as u64 + 1;
+        table.add_row([position.to_string(), alias, entry.id.to_string(), date]);
     }
     Ok(table.to_string())
 }

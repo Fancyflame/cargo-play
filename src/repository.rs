@@ -3,6 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions, TryLockError},
     io,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     process::{Output, Stdio},
 };
@@ -21,6 +22,12 @@ use crate::{
 const MANAGED_MARKER: &str = "cargo-play.bundle-worktree";
 const TARGET_PATHSPEC: &str = ":(top,icase)target";
 const EXCLUDE_TARGET: &str = ":(top,icase,exclude)target";
+
+#[derive(Clone, Debug)]
+pub enum ResumeTarget {
+    Id(Uuid),
+    Position(NonZeroU64),
+}
 
 pub struct Playground {
     home: PathBuf,
@@ -121,11 +128,19 @@ impl Playground {
         Ok(())
     }
 
-    pub async fn resume(&self, id: Uuid, force: bool) -> Result<()> {
+    pub async fn resume(&self, target: ResumeTarget, force: bool) -> Result<()> {
         let state = State::open_existing(&self.home).await?;
         let current = state.active().await?;
+        let id = match target {
+            ResumeTarget::Id(id) => id,
+            ResumeTarget::Position(position) => {
+                state.id_at_position(position).await?.with_context(|| {
+                    format!("找不到序号为 {position} 的游乐场，请运行 cargo-play list 查看。")
+                })?
+            }
+        };
         if current.as_ref().is_some_and(|record| record.id == id) {
-            return Ok(());
+            return state.activate(id).await;
         }
         let target = state
             .by_id(id)
@@ -212,7 +227,6 @@ impl Playground {
                 Some(ArchiveRecord {
                     id: record.id,
                     path: format!("history/{}.bundle", record.id),
-                    timestamp: Timestamp::now().to_string(),
                 })
             } else {
                 None
