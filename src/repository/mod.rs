@@ -140,6 +140,14 @@ impl Playground {
         Ok(())
     }
 
+    pub async fn rename(&self, target: PlaygroundTarget, name: &str) -> Result<()> {
+        let state = State::open_existing(&self.home).await?;
+        let record = Self::resolve_target(&state, target).await?;
+        state.rename(record.id, name).await?;
+        println!("已将演练场 {} 改名为 {name:?}", record.id);
+        Ok(())
+    }
+
     pub async fn clear(&self, force: bool) -> Result<()> {
         let state = State::open_existing(&self.home).await?;
         let current = state.active().await?;

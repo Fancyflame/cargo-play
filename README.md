@@ -53,6 +53,7 @@ cgpl new --name 'Serde demo' --deps serde@1 serde_json
 | `cgpl list [--offset <条数>]` | 按上次访问时间倒序列出演练场，每次最多 50 条。用 `--offset 50` 查看第二页。 |
 | `cgpl open [序号或UUID] [-f]` | 省略目标时直接打开 `play/`。指定目标时归档当前演练场，再切换并打开目标。`-f` 或 `--force` 需要指定目标。打开目录时优先使用 VS Code，其次使用系统默认方式。 |
 | `cgpl backup` | 把当前改动提交到本地 Git 仓库。Git Bundle 在归档时写入。 |
+| `cgpl rename <序号或UUID> <新名称>` | 修改指定演练场的显示名称，例如 `cgpl rename 1 "Serde demo"`。 |
 | `cgpl clear` | 归档当前演练场并清空 `play/`。 |
 | `cgpl delete [序号或UUID] [-y]` | 永久删除指定演练场及其归档。省略目标时删除当前演练场。默认交互确认，`-y` 或 `--yes` 跳过确认。 |
 

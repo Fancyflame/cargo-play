@@ -1,5 +1,6 @@
 mod auto_delete;
 mod deletion;
+mod rename;
 
 use std::{
     cell::RefCell,

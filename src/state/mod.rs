@@ -126,6 +126,18 @@ impl State {
         Ok(txn)
     }
 
+    pub async fn rename(&self, id: Uuid, name: &str) -> Result<()> {
+        playground::ActiveModel {
+            id: Set(id),
+            name: Set(name.to_owned()),
+            ..Default::default()
+        }
+        .update(&self.0)
+        .await
+        .with_context(|| format!("修改演练场 {id} 的显示名称失败"))?;
+        Ok(())
+    }
+
     pub async fn activate(&self, id: Uuid) -> Result<()> {
         async {
             let txn = self.0.begin().await?;

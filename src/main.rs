@@ -45,6 +45,15 @@ enum Action {
         #[arg(short, long)]
         force: bool,
     },
+    /// 修改指定演练场的显示名称
+    Rename {
+        /// 从 1 开始的全库序号，或演练场 UUID，可通过 list 查看
+        #[arg(value_name = "序号或UUID", allow_negative_numbers = true)]
+        target: PlaygroundTarget,
+        /// 新的显示名称
+        #[arg(value_name = "新名称", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        name: String,
+    },
     /// 永久删除演练场，省略目标时删除当前演练场
     Delete {
         /// 从 1 开始的全库序号，或演练场 UUID，可通过 list 查看
@@ -144,6 +153,12 @@ async fn run(
             let home = config::resolve_home(home)?;
             let table = list_playgrounds(&home, &TimeZone::system(), offset).await?;
             println!("{table}");
+        }
+        Action::Rename { target, name } => {
+            Playground::open(home, false)
+                .await?
+                .rename(target, &name)
+                .await?;
         }
         Action::Delete { target, yes } => {
             let by_position = matches!(&target, Some(PlaygroundTarget::Position(_)));
