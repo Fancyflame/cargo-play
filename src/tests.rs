@@ -1,3 +1,5 @@
+mod deletion;
+
 use std::{
     cell::RefCell,
     fs,
@@ -13,7 +15,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::{
-    Action, Cli, Playground, ResumeTarget, default_package_name, list_playgrounds, run,
+    Action, Cli, Playground, PlaygroundTarget, default_package_name, list_playgrounds, run,
     state::{NameMatch, PlaygroundRecord, State},
 };
 
@@ -284,16 +286,15 @@ fn parses_cli() {
     let uuid = id.to_string();
     let cli = Cli::try_parse_from(["cgpl", "resume", &uuid]).unwrap();
     assert!(
-        matches!(cli.command, Action::Resume { target: ResumeTarget::Id(parsed), force: false } if parsed == id)
+        matches!(cli.command, Action::Resume { target: PlaygroundTarget::Id(parsed), force: false } if parsed == id)
     );
     let cli = Cli::try_parse_from(["cgpl", "resume", "10000", "--force"]).unwrap();
     assert!(
-        matches!(cli.command, Action::Resume { target: ResumeTarget::Position(position), force: true } if position.get() == 10000)
+        matches!(cli.command, Action::Resume { target: PlaygroundTarget::Position(position), force: true } if position.get() == 10000)
     );
-    let cli =
-        Cli::try_parse_from(["cgpl", "resume", "00000000000000000000000000000001"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "resume", "00000000000000000000000000000001"]).unwrap();
     assert!(
-        matches!(cli.command, Action::Resume { target: ResumeTarget::Id(id), .. } if id == Uuid::from_u128(1))
+        matches!(cli.command, Action::Resume { target: PlaygroundTarget::Id(id), .. } if id == Uuid::from_u128(1))
     );
     for invalid in ["0", "-1", "1.5", "18446744073709551616", "not-a-uuid"] {
         assert!(
@@ -304,7 +305,7 @@ fn parses_cli() {
     for flag in ["-f", "--force"] {
         let cli = Cli::try_parse_from(["cgpl", "resume", &uuid, flag]).unwrap();
         assert!(
-            matches!(cli.command, Action::Resume { target: ResumeTarget::Id(parsed), force: true } if parsed == id)
+            matches!(cli.command, Action::Resume { target: PlaygroundTarget::Id(parsed), force: true } if parsed == id)
         );
         let cli = Cli::try_parse_from(["cgpl", "new", "-d", "serde", flag]).unwrap();
         assert!(
@@ -936,7 +937,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Id(original.id),
+                target: PlaygroundTarget::Id(original.id),
                 force: true,
             },
             |path| {
@@ -984,7 +985,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Id(other.id),
+                target: PlaygroundTarget::Id(other.id),
                 force: false,
             },
             |_| Ok(()),
@@ -1002,7 +1003,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Id(original.id),
+                target: PlaygroundTarget::Id(original.id),
                 force: false,
             },
             |_| Ok(()),
@@ -1107,8 +1108,8 @@ fn resuming_the_current_playground_updates_its_visit_time_and_opens_it() {
     fs::write(&marker, "invalid marker").unwrap();
     fs::write(fixture.play.join("draft.txt"), "still untracked").unwrap();
     for target in [
-        ResumeTarget::Id(active.id),
-        ResumeTarget::Position(NonZeroU64::MIN),
+        PlaygroundTarget::Id(active.id),
+        PlaygroundTarget::Position(NonZeroU64::MIN),
     ] {
         let mut opened = false;
         let before_resume = Timestamp::now();
@@ -1160,7 +1161,7 @@ fn resume_requires_force_to_discard_an_unregistered_workspace() {
     let error = fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Id(id),
+                target: PlaygroundTarget::Id(id),
                 force: false,
             },
             not_opened,
@@ -1172,7 +1173,7 @@ fn resume_requires_force_to_discard_an_unregistered_workspace() {
     fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Position(NonZeroU64::new(2).unwrap()),
+                target: PlaygroundTarget::Position(NonZeroU64::new(2).unwrap()),
                 force: true,
             },
             |_| Ok(()),
@@ -1190,7 +1191,7 @@ fn unknown_uuid_does_not_clear_the_current_workspace() {
     let error = fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Id(id),
+                target: PlaygroundTarget::Id(id),
                 force: true,
             },
             not_opened,
@@ -1215,7 +1216,7 @@ fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
     let error = fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Id(target.id),
+                target: PlaygroundTarget::Id(target.id),
                 force: false,
             },
             not_opened,
@@ -1231,7 +1232,7 @@ fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
     fixture
         .run(
             Action::Resume {
-                target: ResumeTarget::Id(previous.id),
+                target: PlaygroundTarget::Id(previous.id),
                 force: false,
             },
             |_| Ok(()),
@@ -1278,8 +1279,12 @@ fn locks_mutating_commands_at_home() {
         Action::Backup,
         new(&[]),
         Action::Resume {
-            target: ResumeTarget::Id(id),
+            target: PlaygroundTarget::Id(id),
             force: false,
+        },
+        Action::Delete {
+            target: None,
+            yes: true,
         },
     ] {
         assert!(

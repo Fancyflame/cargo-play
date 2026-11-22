@@ -3,13 +3,21 @@ mod editor;
 mod repository;
 mod state;
 
-use std::{env, ffi::OsString, path::Path, process::ExitCode, str::FromStr};
+use std::{
+    env,
+    ffi::OsString,
+    io::{self, BufRead, IsTerminal, Write},
+    path::Path,
+    process::ExitCode,
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 use jiff::{Zoned, tz::TimeZone};
-use repository::{Playground, ResumeTarget, directory_exists};
+use repository::{Playground, PlaygroundTarget, directory_exists};
+use state::PlaygroundRecord;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -41,10 +49,19 @@ enum Action {
     Resume {
         /// 从 1 开始的全库序号，或游乐场 UUID，可通过 list 查看
         #[arg(value_name = "序号或UUID", allow_negative_numbers = true)]
-        target: ResumeTarget,
+        target: PlaygroundTarget,
         /// 允许替换未登记的旧工作区
         #[arg(short, long)]
         force: bool,
+    },
+    /// 永久删除游乐场，省略目标时删除当前游乐场
+    Delete {
+        /// 从 1 开始的全库序号，或游乐场 UUID，可通过 list 查看
+        #[arg(value_name = "序号或UUID", allow_negative_numbers = true)]
+        target: Option<PlaygroundTarget>,
+        /// 跳过交互确认
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// 打开当前试验文件夹
     Open,
@@ -58,7 +75,7 @@ enum Action {
     },
 }
 
-impl FromStr for ResumeTarget {
+impl FromStr for PlaygroundTarget {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self> {
@@ -127,6 +144,18 @@ async fn run(
             drop(playground);
             open_play_folder(&folder, open).await?;
         }
+        Action::Delete { target, yes } => {
+            Playground::open(home, false)
+                .await?
+                .delete(target, |record, is_current| {
+                    if yes {
+                        Ok(true)
+                    } else {
+                        confirm_delete(record, is_current)
+                    }
+                })
+                .await?;
+        }
         Action::New { deps, name, force } => {
             let playground = Playground::open(home, true).await?;
             playground
@@ -143,6 +172,40 @@ async fn run(
         }
     }
     Ok(())
+}
+
+fn confirm_delete(record: &PlaygroundRecord, is_current: bool) -> Result<bool> {
+    let stdin = io::stdin();
+    ensure!(
+        stdin.is_terminal(),
+        "非交互环境下请传入 -y 或 --yes 确认删除。"
+    );
+
+    let mut stderr = io::stderr().lock();
+    writeln!(
+        stderr,
+        "将永久删除游乐场 {:?} ({})。",
+        record.name, record.id
+    )?;
+    if is_current {
+        writeln!(
+            stderr,
+            "当前 play 目录中的所有内容都会被删除，包括未提交和被 Git 忽略的文件。"
+        )?;
+    }
+    if record.archived_path.is_some() {
+        writeln!(stderr, "对应的 Git Bundle 也会被删除。")?;
+    }
+    write!(stderr, "确认删除？[y/N] ")?;
+    stderr.flush()?;
+    read_delete_confirmation(stdin.lock())
+}
+
+fn read_delete_confirmation(mut input: impl BufRead) -> Result<bool> {
+    let mut answer = String::new();
+    input.read_line(&mut answer).context("读取删除确认失败")?;
+    let answer = answer.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 async fn list_playgrounds(home: &Path, time_zone: &TimeZone, offset: u64) -> Result<String> {
