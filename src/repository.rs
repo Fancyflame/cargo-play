@@ -108,7 +108,7 @@ impl Playground {
             let bundle = history.archive(&name, |path| old.bundle(path, &next))?;
             println!("已归档 {name} 到 {}", bundle.display());
         }
-        self.replace(staging, &next, existing)?;
+        self.replace(staging, &next, existing, |from, to| fs::rename(from, to))?;
         println!("已创建试验 {package}");
         if !deps.is_empty() {
             println!("已提交依赖 {}", deps.join(", "));
@@ -116,24 +116,59 @@ impl Playground {
         Ok(())
     }
 
-    fn replace(&self, staging: TempDir, next: &Path, existing: bool) -> Result<()> {
-        let previous = staging.path().join("previous");
+    fn replace(
+        &self,
+        staging: TempDir,
+        next: &Path,
+        existing: bool,
+        mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+    ) -> Result<()> {
         if existing {
-            fs::rename(&self.root, &previous)
-                .with_context(|| format!("移开原工作区 {} 失败", self.root.display()))?;
-        }
-        if let Err(error) = fs::rename(next, &self.root) {
-            if existing && let Err(restore) = fs::rename(&previous, &self.root) {
-                // Keep the old directory even when Windows refuses to move it back.
-                let kept = staging.keep().join("previous");
-                return Err(error).with_context(|| {
-                    format!(
-                        "启用新工作区失败，恢复原工作区也失败（{restore}），原工作区保留在 {}",
-                        kept.display()
-                    )
-                });
+            let previous = staging.path().join("previous");
+            let old_entries = entry_names(&self.root).context("读取原工作区失败")?;
+            let new_entries = entry_names(next).context("启用新工作区失败")?;
+            fs::create_dir(&previous).context("创建原工作区的临时备份目录失败")?;
+
+            // Leave `play` in place because it may be another process's current directory.
+            let mut moved = Vec::new();
+            let result = (|| {
+                for (source, destination, entries, action) in [
+                    (
+                        self.root.as_path(),
+                        previous.as_path(),
+                        old_entries,
+                        "移开原工作区内容失败",
+                    ),
+                    (next, self.root.as_path(), new_entries, "启用新工作区失败"),
+                ] {
+                    for name in entries {
+                        let from = source.join(&name);
+                        let to = destination.join(&name);
+                        move_entry(&from, &to, &mut rename).context(action)?;
+                        moved.push((from, to));
+                    }
+                }
+                Ok::<(), Error>(())
+            })();
+            if let Err(error) = result {
+                let mut restore_errors = Vec::new();
+                for (from, to) in moved.into_iter().rev() {
+                    if let Err(error) = move_entry(&to, &from, &mut rename) {
+                        restore_errors.push(format!("{error:#}"));
+                    }
+                }
+                if restore_errors.is_empty() {
+                    return Err(error);
+                }
+                let kept = staging.keep();
+                return Err(error.context(format!(
+                    "恢复原工作区失败，暂存内容保留在 {}（{}）",
+                    kept.display(),
+                    restore_errors.join("；")
+                )));
             }
-            return Err(error).context("启用新工作区失败");
+        } else {
+            move_entry(next, &self.root, &mut rename).context("启用新工作区失败")?;
         }
         let cleanup_path = staging.path().to_owned();
         if let Err(error) = staging.close() {
@@ -141,6 +176,28 @@ impl Playground {
         }
         Ok(())
     }
+}
+
+fn entry_names(path: &Path) -> Result<Vec<OsString>> {
+    let read_entries = || -> io::Result<Vec<OsString>> {
+        fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect()
+    };
+    read_entries().with_context(|| format!("读取 {} 失败", path.display()))
+}
+
+fn move_entry(
+    from: &Path,
+    to: &Path,
+    rename: &mut impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
+    let result = match fs::symlink_metadata(to) {
+        Ok(_) => Err(io::Error::new(io::ErrorKind::AlreadyExists, "目标已存在")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => rename(from, to),
+        Err(error) => Err(error),
+    };
+    result.with_context(|| format!("移动 {} 到 {} 失败", from.display(), to.display()))
 }
 
 pub fn directory_exists(path: &Path) -> Result<bool> {
@@ -563,8 +620,7 @@ fn command_error(label: &str, output: &Output) -> Error {
 mod replacement_tests {
     use super::*;
 
-    #[test]
-    fn restores_play_when_the_replacement_cannot_be_installed() {
+    fn replacement_fixture() -> (TempDir, Playground, TempDir, PathBuf) {
         let home = tempfile::tempdir().unwrap();
         let playground = Playground::open(
             Some(home.path().as_os_str().to_owned()),
@@ -574,16 +630,121 @@ mod replacement_tests {
         .unwrap();
         fs::create_dir(&playground.root).unwrap();
         fs::write(playground.root.join("keep.txt"), "old project").unwrap();
+        fs::write(playground.root.join(".old"), "old hidden file").unwrap();
         let staging = tempfile::tempdir_in(home.path()).unwrap();
-        let missing = staging.path().join("next");
-        let error = playground.replace(staging, &missing, true).unwrap_err();
+        let next = staging.path().join("next");
+        fs::create_dir(&next).unwrap();
+        fs::write(next.join("keep.txt"), "new project").unwrap();
+        fs::write(next.join("new.txt"), "new file").unwrap();
+        (home, playground, staging, next)
+    }
+
+    fn assert_old_project(root: &Path) {
+        assert_eq!(
+            fs::read_to_string(root.join("keep.txt")).unwrap(),
+            "old project"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".old")).unwrap(),
+            "old hidden file"
+        );
+        assert!(!root.join("new.txt").exists());
+    }
+
+    #[test]
+    fn preserves_play_when_staged_project_is_missing() {
+        let (_home, playground, staging, next) = replacement_fixture();
+        let missing = next.join("missing");
+        let error = playground
+            .replace(staging, &missing, true, |from, to| fs::rename(from, to))
+            .unwrap_err();
         assert!(error.to_string().contains("启用新工作区失败"), "{error:#}");
         assert_eq!(
             error.downcast_ref::<io::Error>().map(io::Error::kind),
             Some(io::ErrorKind::NotFound)
         );
+        assert_old_project(&playground.root);
+    }
+
+    #[test]
+    fn restores_play_when_moving_old_entries_fails() {
+        let (_home, playground, staging, next) = replacement_fixture();
+        let staging_path = staging.path().to_owned();
+        let mut old_moves = 0;
+        let error = playground
+            .replace(staging, &next, true, |from, to| {
+                if from.parent() == Some(&playground.root) {
+                    old_moves += 1;
+                    if old_moves == 2 {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                }
+                fs::rename(from, to)
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("移开原工作区内容失败"),
+            "{error:#}"
+        );
+        assert_old_project(&playground.root);
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn restores_play_when_installation_fails_after_moving_a_new_entry() {
+        let (_home, playground, staging, next) = replacement_fixture();
+        let staging_path = staging.path().to_owned();
+        let mut new_moves = 0;
+        let error = playground
+            .replace(staging, &next, true, |from, to| {
+                if from.parent() == Some(&next) {
+                    new_moves += 1;
+                    if new_moves == 2 {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                }
+                fs::rename(from, to)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("启用新工作区失败"), "{error:#}");
+        assert_old_project(&playground.root);
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn keeps_backup_when_a_new_file_blocks_rollback() {
+        let (_home, playground, staging, next) = replacement_fixture();
+        let staging_path = staging.path().to_owned();
+        let obstructed = playground.root.join("keep.txt");
+        let error = playground
+            .replace(staging, &next, true, |from, to| {
+                if from.parent() == Some(&next) {
+                    fs::write(&obstructed, "created by another process")?;
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                fs::rename(from, to)
+            })
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("恢复原工作区失败"), "{message}");
+        assert!(
+            message.contains(&staging_path.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&obstructed.display().to_string()),
+            "{message}"
+        );
         assert_eq!(
-            fs::read_to_string(playground.root.join("keep.txt")).unwrap(),
+            fs::read_to_string(&obstructed).unwrap(),
+            "created by another process"
+        );
+        assert_eq!(
+            fs::read_to_string(playground.root.join(".old")).unwrap(),
+            "old hidden file"
+        );
+        assert_eq!(
+            fs::read_to_string(staging_path.join("previous/keep.txt")).unwrap(),
             "old project"
         );
     }

@@ -282,6 +282,53 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
 }
 
+#[cfg(windows)]
+#[test]
+fn new_from_play_directory_preserves_play() {
+    const CHILD: &str = "CARGO_PLAY_TEST_FROM_PLAY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let play = std::env::current_dir().unwrap();
+        let home = play.parent().unwrap();
+        TEST_GIT_CONFIG.set(Some(home.join("test-gitconfig")));
+        run(
+            new(&[]),
+            Some(home.as_os_str().to_owned()),
+            prepare_config,
+            |folder| {
+                assert_eq!(folder, play);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(std::env::current_dir().unwrap(), play);
+        assert!(Path::new("src/main.rs").is_file());
+        return;
+    }
+
+    let fixture = Fixture::previous_trial();
+    fs::write(fixture.play.join(".old"), "remove me").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::new_from_play_directory_preserves_play",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .current_dir(&fixture.play)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.play.join("old.txt").exists());
+    assert!(!fixture.play.join(".old").exists());
+    assert!(fixture.archive_at("old-trial").is_file());
+    assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
+}
+
 #[test]
 fn nonempty_play_without_manifest_requires_force_even_without_git() {
     let fixture = Fixture::empty();
