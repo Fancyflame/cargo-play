@@ -339,6 +339,15 @@ fn parses_cli() {
     }
 }
 
+async fn list_playgrounds_text(
+    home: &Path,
+    time_zone: &tz::TimeZone,
+    offset: u64,
+) -> anyhow::Result<String> {
+    let mut table = list_playgrounds(home, time_zone, offset).await?;
+    Ok(table.force_no_tty().to_string())
+}
+
 fn table_rows(table: &str) -> Vec<Vec<&str>> {
     table
         .lines()
@@ -408,7 +417,7 @@ fn lists_all_playgrounds_by_visit_time_and_uuid() {
             .unwrap();
         let before = fs::read(fixture.home.join("workspace.sqlite3")).unwrap();
         let time_zone = tz::offset(8).to_time_zone();
-        let table = list_playgrounds(&fixture.home, &time_zone, 0)
+        let table = list_playgrounds_text(&fixture.home, &time_zone, 0)
             .await
             .unwrap();
         assert_eq!(
@@ -468,7 +477,62 @@ fn lists_all_playgrounds_by_visit_time_and_uuid() {
             ],
         ]
     );
+    assert_eq!(
+        table
+            .lines()
+            .filter_map(|line| line.chars().next())
+            .collect::<String>(),
+        "┌│╞│├│├│├│├│├│└"
+    );
     assert!(!table.contains('\x1b'));
+}
+
+#[test]
+fn list_wraps_cells_to_fit_narrow_terminals() {
+    use unicode_width::UnicodeWidthStr;
+
+    let fixture = Fixture::empty();
+    let id = Uuid::from_u128(42);
+    let name = "中文Rust演练场🦀".repeat(8);
+    let mut table = block_on(async {
+        let state = State::open(&fixture.home).await.unwrap();
+        state
+            .connection()
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO playgrounds (id, name, last_visit_time) VALUES (?, ?, ?)",
+                [
+                    id.into(),
+                    name.as_str().into(),
+                    "2025-02-02T18:04:05Z".into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 0)
+            .await
+            .unwrap()
+    });
+    let full_width = table.force_no_tty().to_string();
+    assert_eq!(table_rows(&full_width)[1][1], name);
+    assert_eq!(table_rows(&full_width)[1][2], id.to_string());
+    for width in [24, 32, 48, 80] {
+        let wrapped = table.set_width(width).to_string();
+        let line_width = wrapped.lines().next().unwrap().width();
+        assert!(line_width <= usize::from(width), "{wrapped}");
+        assert!(
+            wrapped.lines().all(|line| line.width() == line_width),
+            "{wrapped}"
+        );
+        assert!(wrapped.lines().count() > full_width.lines().count());
+        assert!(!wrapped.lines().any(|line| line.starts_with('├')));
+        let (_, body) = wrapped.split_once('╡').unwrap();
+        let rows = table_rows(body);
+        let name_parts: String = rows.iter().map(|row| row[1]).collect();
+        let id_parts: String = rows.iter().map(|row| row[2]).collect();
+        assert_eq!(name_parts, name);
+        assert_eq!(id_parts, id.to_string());
+    }
 }
 
 #[test]
@@ -476,7 +540,7 @@ fn lists_only_headers_for_an_empty_database() {
     let fixture = Fixture::empty();
     let table = block_on(async {
         State::open(&fixture.home).await.unwrap();
-        list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 0)
+        list_playgrounds_text(&fixture.home, &tz::TimeZone::UTC, 0)
             .await
             .unwrap()
     });
@@ -504,7 +568,7 @@ fn list_reports_the_id_with_an_invalid_visit_timestamp() {
             "INSERT INTO playgrounds (id, name, archived_path, last_visit_time) VALUES (?, '测试', 'history/old.bundle', 'invalid')",
             [id.into()],
         )).await.unwrap();
-        list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 0)
+        list_playgrounds_text(&fixture.home, &tz::TimeZone::UTC, 0)
             .await
             .unwrap_err()
     });
@@ -1114,7 +1178,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
         fs::read_to_string(fixture.play.join(".git/cargo-play.bundle-worktree")).unwrap(),
         format!("{}\n", original.id)
     );
-    let table = block_on(list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 0)).unwrap();
+    let table = block_on(list_playgrounds_text(&fixture.home, &tz::TimeZone::UTC, 0)).unwrap();
     assert_eq!(
         table_rows(&table)[1],
         [
@@ -1199,7 +1263,7 @@ fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
                     '2025-01-02T00:00:00Z' FROM positions",
         ).await.unwrap();
         for offset in [0, 50] {
-            let table = list_playgrounds(&fixture.home, &tz::TimeZone::UTC, offset)
+            let table = list_playgrounds_text(&fixture.home, &tz::TimeZone::UTC, offset)
                 .await
                 .unwrap();
             let rows = table_rows(&table);
@@ -1213,7 +1277,7 @@ fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
             };
             assert_eq!(rows[1][2], first_id.to_string());
         }
-        let table = list_playgrounds(&fixture.home, &tz::TimeZone::UTC, 10000)
+        let table = list_playgrounds_text(&fixture.home, &tz::TimeZone::UTC, 10000)
             .await
             .unwrap();
         let rows = table_rows(&table);
@@ -1221,7 +1285,7 @@ fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
         assert_eq!(rows[2][0], "10002");
         assert_eq!(rows[2][2], original.id.to_string());
         for offset in [10002, u64::MAX] {
-            let table = list_playgrounds(&fixture.home, &tz::TimeZone::UTC, offset)
+            let table = list_playgrounds_text(&fixture.home, &tz::TimeZone::UTC, offset)
                 .await
                 .unwrap();
             assert_eq!(table_rows(&table), [["序号", "名称", "ID", "上次访问"]]);

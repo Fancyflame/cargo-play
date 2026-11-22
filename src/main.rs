@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
-use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use jiff::{ZonedDateTime, tz::TimeZone};
 use repository::{Playground, PlaygroundTarget, directory_exists};
 use state::PlaygroundRecord;
@@ -234,11 +234,12 @@ fn read_delete_confirmation(mut input: impl BufRead) -> Result<bool> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-async fn list_playgrounds(home: &Path, time_zone: &TimeZone, offset: u64) -> Result<String> {
+async fn list_playgrounds(home: &Path, time_zone: &TimeZone, offset: u64) -> Result<Table> {
     let entries = state::State::list(home, offset).await?;
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL_CONDENSED)
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(["序号", "名称", "ID", "上次访问"]);
     for (index, entry) in entries.into_iter().enumerate() {
         let mut alias = String::new();
@@ -257,7 +258,7 @@ async fn list_playgrounds(home: &Path, time_zone: &TimeZone, offset: u64) -> Res
         let position = offset + index as u64 + 1;
         table.add_row([position.to_string(), alias, entry.id.to_string(), date]);
     }
-    Ok(table.to_string())
+    Ok(table)
 }
 
 async fn open_play_folder(
