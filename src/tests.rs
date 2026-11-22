@@ -276,7 +276,14 @@ fn parses_cli() {
     assert!(
         matches!(cli.command, Action::New { deps, name: None, force: false } if deps == ["serde@1", "anyhow"])
     );
+    let id = Uuid::new_v4();
+    let uuid = id.to_string();
+    let cli = Cli::try_parse_from(["cargo-play", "resume", &uuid]).unwrap();
+    assert!(matches!(cli.command, Action::Resume { id: parsed, force: false } if parsed == id));
+    assert!(Cli::try_parse_from(["cargo-play", "resume", "not-a-uuid"]).is_err());
     for flag in ["-f", "--force"] {
+        let cli = Cli::try_parse_from(["cargo-play", "resume", &uuid, flag]).unwrap();
+        assert!(matches!(cli.command, Action::Resume { id: parsed, force: true } if parsed == id));
         let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde", flag]).unwrap();
         assert!(
             matches!(cli.command, Action::New { deps, name: None, force: true } if deps == ["serde"])
@@ -756,7 +763,7 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
     let fixture = Fixture::previous_trial();
     let id = fixture.active().id;
     let bundle = fixture.home.join(format!("history/{id}.bundle"));
-    // Simulate an active playground that already has an archive, as after a future restore.
+    // Simulate an active playground that already has an archive after resuming.
     fixture.git(&[
         "bundle",
         "create",
@@ -831,6 +838,203 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
 }
 
 #[test]
+fn resumes_archived_projects_and_preserves_their_identity_and_history() {
+    let fixture = Fixture::previous_trial();
+    fixture.git(&["branch", "-m", "experiment"]);
+    let original = fixture.active();
+    let original_head = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    let other = fixture.active();
+    let original_archive = fixture.record(original.id);
+    let original_bundle = fixture
+        .home
+        .join(original_archive.archived_path.as_ref().unwrap());
+    let bundle_contents = fs::read(&original_bundle).unwrap();
+    fs::write(fixture.play.join("draft.txt"), "other project changes").unwrap();
+
+    fixture
+        .run(
+            Action::Resume {
+                id: original.id,
+                force: true,
+            },
+            |path| {
+                assert_eq!(path, fixture.play);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(fixture.active(), original_archive);
+    assert_eq!(fixture.git(&["branch", "--show-current"]), "experiment");
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), original_head);
+    assert_eq!(fs::read(&original_bundle).unwrap(), bundle_contents);
+    assert_eq!(
+        fs::read_to_string(fixture.play.join(".git/cargo-play.bundle-worktree")).unwrap(),
+        format!("{}\n", original.id)
+    );
+    let table = block_on(list_playgrounds(&fixture.home, &tz::TimeZone::UTC)).unwrap();
+    assert_eq!(
+        table_rows(&table)[1],
+        [original.name.as_str(), &original.id.to_string(), "当前"]
+    );
+    assert!(!fixture.play.join("draft.txt").exists());
+    fs::write(fixture.play.join("old.txt"), "original project changes").unwrap();
+
+    fixture
+        .run(
+            Action::Resume {
+                id: other.id,
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.active().id, other.id);
+    assert_eq!(fixture.active().name, other.name);
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("draft.txt")).unwrap(),
+        "other project changes"
+    );
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "");
+    assert_ne!(fs::read(&original_bundle).unwrap(), bundle_contents);
+
+    fixture
+        .run(
+            Action::Resume {
+                id: original.id,
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.git(&["rev-parse", "HEAD^"]), original_head);
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("old.txt")).unwrap(),
+        "original project changes"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.home.join("history")).unwrap().count(),
+        2
+    );
+}
+
+#[test]
+fn resuming_the_current_uuid_only_opens_the_folder() {
+    let fixture = Fixture::previous_trial();
+    let active = fixture.active();
+    let marker = fixture.play.join(".git/cargo-play.bundle-worktree");
+    fs::write(&marker, "invalid marker").unwrap();
+    fs::write(fixture.play.join("draft.txt"), "still untracked").unwrap();
+    let mut opened = false;
+    fixture
+        .run(
+            Action::Resume {
+                id: active.id,
+                force: false,
+            },
+            |path| {
+                assert_eq!(path, fixture.play);
+                opened = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(opened);
+    assert_eq!(fixture.active(), active);
+    assert_eq!(fs::read_to_string(marker).unwrap(), "invalid marker");
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
+    fixture.assert_no_archives();
+}
+
+#[test]
+fn resume_requires_force_to_discard_an_unregistered_workspace() {
+    let fixture = Fixture::previous_trial();
+    let id = fixture.active().id;
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    block_on(async {
+        State::open(&fixture.home)
+            .await
+            .unwrap()
+            .stage_clear(None)
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+    });
+    fs::write(
+        fixture.play.join("unregistered.txt"),
+        "unregistered contents",
+    )
+    .unwrap();
+    let error = fixture
+        .run(Action::Resume { id, force: false }, not_opened)
+        .unwrap_err();
+    assert!(error.to_string().contains("cargo-play resume --force"));
+    assert!(fixture.play.join("unregistered.txt").is_file());
+
+    fixture
+        .run(Action::Resume { id, force: true }, |_| Ok(()))
+        .unwrap();
+    assert_eq!(fixture.active().id, id);
+    assert!(!fixture.play.join("unregistered.txt").exists());
+}
+
+#[test]
+fn unknown_uuid_does_not_clear_the_current_workspace() {
+    let fixture = Fixture::previous_trial();
+    let active = fixture.active();
+    let id = Uuid::new_v4();
+    let error = fixture
+        .run(Action::Resume { id, force: true }, not_opened)
+        .unwrap_err();
+    assert!(error.to_string().contains(&id.to_string()));
+    assert_eq!(fixture.active(), active);
+    assert!(fixture.play.join("old.txt").is_file());
+    fixture.assert_no_archives();
+}
+
+#[test]
+fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
+    let fixture = Fixture::previous_trial();
+    let target = fixture.active();
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    let previous = fixture.active();
+    fs::write(fixture.archive_at(&target.name), "invalid bundle").unwrap();
+    fs::write(fixture.play.join("draft.txt"), "archive before cloning").unwrap();
+
+    let error = fixture
+        .run(
+            Action::Resume {
+                id: target.id,
+                force: false,
+            },
+            not_opened,
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("git clone"), "{error:#}");
+    block_on(async {
+        let state = State::open_existing(&fixture.home).await.unwrap();
+        assert!(state.active().await.unwrap().is_none());
+    });
+    assert!(fixture.archive_at(&previous.name).is_file());
+    fixture
+        .run(
+            Action::Resume {
+                id: previous.id,
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.active().id, previous.id);
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("draft.txt")).unwrap(),
+        "archive before cloning"
+    );
+}
+
+#[test]
 fn checks_git_operations() {
     let fixture = Fixture::previous_trial();
     let head = fixture.git(&["rev-parse", "HEAD"]);
@@ -857,8 +1061,14 @@ fn checks_git_operations() {
 #[test]
 fn locks_mutating_commands_at_home() {
     let fixture = Fixture::previous_trial();
+    let id = fixture.active().id;
     let lock = fixture.playground();
-    for action in [Action::Init, Action::Backup, new(&[])] {
+    for action in [
+        Action::Init,
+        Action::Backup,
+        new(&[]),
+        Action::Resume { id, force: false },
+    ] {
         assert!(
             fixture
                 .run(action, not_opened)

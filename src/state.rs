@@ -1,4 +1,7 @@
-use std::{cmp::Reverse, path::Path};
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use jiff::Timestamp;
@@ -95,7 +98,7 @@ struct PlaygroundListRow {
 impl State {
     pub async fn open(home: &Path) -> Result<Self> {
         let path = home.join(DB_FILE);
-        let db = Self::connect(&path, false).await?;
+        let db = Self::connect(&path, false, true).await?;
         async {
             let txn = db.begin().await?;
             for stmt in SCHEMA {
@@ -108,12 +111,17 @@ impl State {
         Ok(Self(db))
     }
 
-    async fn connect(path: &Path, read_only: bool) -> Result<DatabaseConnection> {
+    pub async fn open_existing(home: &Path) -> Result<Self> {
+        let path = Self::existing_path(home).await?;
+        Ok(Self(Self::connect(&path, false, false).await?))
+    }
+
+    async fn connect(path: &Path, read_only: bool, create: bool) -> Result<DatabaseConnection> {
         // A filename passed directly to SQLite avoids URL escaping of the home path.
         let options = SqliteConnectOptions::new()
             .filename(path)
             .read_only(read_only)
-            .create_if_missing(!read_only)
+            .create_if_missing(create)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -123,7 +131,7 @@ impl State {
         Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
     }
 
-    pub async fn list(home: &Path) -> Result<Vec<PlaygroundListEntry>> {
+    async fn existing_path(home: &Path) -> Result<PathBuf> {
         let path = home.join(DB_FILE);
         ensure!(
             tokio::fs::try_exists(&path)
@@ -131,7 +139,12 @@ impl State {
                 .with_context(|| format!("检查状态数据库 {} 失败", path.display()))?,
             "首次使用请运行 cargo-play init。"
         );
-        let db = Self::connect(&path, true).await?;
+        Ok(path)
+    }
+
+    pub async fn list(home: &Path) -> Result<Vec<PlaygroundListEntry>> {
+        let path = Self::existing_path(home).await?;
+        let db = Self::connect(&path, true, false).await?;
         let rows = PlaygroundListRow::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT p.id, p.name, CASE WHEN c.slot IS NULL THEN p.archived_at END AS archived_at
@@ -182,7 +195,7 @@ impl State {
         Ok(playground::Entity::find_by_id(id).one(&self.0).await?)
     }
 
-    // Used by the future restore command. Ambiguous names require a UUID from the caller.
+    // Names are not unique; commands that select a playground use its UUID.
     pub async fn find_by_name(&self, name: &str) -> Result<NameMatch> {
         let matches = playground::Entity::find()
             .filter(playground::Column::Name.eq(name))
@@ -216,16 +229,7 @@ impl State {
     ) -> Result<DatabaseTransaction> {
         async {
             let txn = self.0.begin().await?;
-            if let Some(archive) = archive {
-                playground::ActiveModel {
-                    id: Set(archive.id),
-                    archived_path: Set(Some(archive.path.clone())),
-                    archived_at: Set(Some(archive.timestamp.clone())),
-                    ..Default::default()
-                }
-                .update(&txn)
-                .await?;
-            }
+            Self::record_archive(&txn, archive).await?;
             playground::ActiveModel {
                 id: Set(id),
                 name: Set(name.to_owned()),
@@ -234,21 +238,63 @@ impl State {
             }
             .insert(&txn)
             .await?;
-            current::Entity::insert(current::ActiveModel {
-                slot: Set(1),
-                playground_id: Set(id),
-            })
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::column(current::Column::Slot)
-                    .update_column(current::Column::PlaygroundId)
-                    .to_owned(),
-            )
-            .exec(&txn)
-            .await?;
+            Self::set_current(&txn, id).await?;
             Ok::<_, sea_orm::DbErr>(txn)
         }
         .await
         .context("写入工作区状态失败")
+    }
+
+    pub async fn stage_clear(
+        &self,
+        archive: Option<&ArchiveRecord>,
+    ) -> Result<DatabaseTransaction> {
+        async {
+            let txn = self.0.begin().await?;
+            Self::record_archive(&txn, archive).await?;
+            current::Entity::delete_by_id(1).exec(&txn).await?;
+            Ok::<_, sea_orm::DbErr>(txn)
+        }
+        .await
+        .context("清除当前游乐场状态失败")
+    }
+
+    pub async fn activate(&self, id: Uuid) -> Result<()> {
+        Self::set_current(&self.0, id)
+            .await
+            .with_context(|| format!("设置当前游乐场 {id} 失败"))
+    }
+
+    async fn record_archive(
+        txn: &DatabaseTransaction,
+        archive: Option<&ArchiveRecord>,
+    ) -> Result<(), sea_orm::DbErr> {
+        if let Some(archive) = archive {
+            playground::ActiveModel {
+                id: Set(archive.id),
+                archived_path: Set(Some(archive.path.clone())),
+                archived_at: Set(Some(archive.timestamp.clone())),
+                ..Default::default()
+            }
+            .update(txn)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn set_current(db: &impl ConnectionTrait, id: Uuid) -> Result<(), sea_orm::DbErr> {
+        current::Entity::insert(current::ActiveModel {
+            slot: Set(1),
+            playground_id: Set(id),
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(current::Column::Slot)
+                .update_column(current::Column::PlaygroundId)
+                .to_owned(),
+        )
+        .exec(db)
+        .await?;
+        Ok(())
     }
 
     #[cfg(test)]

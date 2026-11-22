@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{prepare_config, resolve_home},
-    state::{ArchiveRecord, State},
+    state::{ArchiveRecord, PlaygroundRecord, State},
 };
 
 const MANAGED_MARKER: &str = "cargo-play.bundle-worktree";
@@ -82,20 +82,13 @@ impl Playground {
         self.prepare_history().await?;
         let state = State::open(&self.home).await?;
         let current = state.active().await?;
-        if let Some(record) = &current {
-            self.verify_current(record.id).await?;
-        } else if existing && !force && !worktree_is_empty(&self.root).await? {
-            bail!(
-                "{} 包含未登记的项目。确认丢弃后可运行 cargo-play new --force。",
-                self.root.display()
-            );
-        }
+        self.check_replacement(existing, current.as_ref(), force, "new")
+            .await?;
         let package = state.next_default_name(base).await?;
         let display_name = name.unwrap_or(&package);
         let id = Uuid::new_v4();
         let staging = temporary_dir(Some(&self.home), ".cargo-play-new-").await?;
         let next = staging.path().join("next");
-        let mut changes = WorkspaceChanges::default();
         let result = async {
             fs::create_dir(&next).await.context("创建新工作区失败")?;
             let fresh = Worktree::init(&next).await?;
@@ -106,14 +99,115 @@ impl Playground {
             if !deps.is_empty() {
                 fresh.add_dependencies(deps).await?;
             }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            close_tempdir(staging).await;
+            return Err(error);
+        }
+        self.replace_worktree(
+            &state,
+            staging,
+            existing,
+            current.as_ref(),
+            Some((id, display_name)),
+        )
+        .await?;
+        println!("已创建试验 {display_name:?} ({id})");
+        if !deps.is_empty() {
+            println!("已提交依赖 {}", deps.join(", "));
+        }
+        Ok(())
+    }
 
-            let archive = if let Some(record) = &current {
+    pub async fn resume(&self, id: Uuid, force: bool) -> Result<()> {
+        let state = State::open_existing(&self.home).await?;
+        let current = state.active().await?;
+        if current.as_ref().is_some_and(|record| record.id == id) {
+            return Ok(());
+        }
+        let target = state
+            .by_id(id)
+            .await?
+            .with_context(|| format!("找不到游乐场 {id}"))?;
+        let bundle = target
+            .archived_path
+            .with_context(|| format!("游乐场 {id} 没有归档"))?;
+        let existing = directory_exists(&self.root).await?;
+        self.check_replacement(existing, current.as_ref(), force, "resume")
+            .await?;
+        self.prepare_history().await?;
+
+        let staging = temporary_dir(Some(&self.home), ".cargo-play-resume-").await?;
+        fs::create_dir(staging.path().join("next"))
+            .await
+            .context("创建空工作区失败")?;
+        self.replace_worktree(&state, staging, existing, current.as_ref(), None)
+            .await?;
+
+        // Clearing the active record first keeps the previous project available in history
+        // if Git cannot clone the requested bundle.
+        let bundle = self.home.join(bundle);
+        checked(
+            "git clone",
+            git(
+                &self.home,
+                [
+                    OsStr::new("clone"),
+                    OsStr::new("--"),
+                    bundle.as_os_str(),
+                    self.root.as_os_str(),
+                ],
+            )
+            .await?,
+        )
+        .with_context(|| format!("从 Bundle 恢复游乐场 {id} 失败"))?;
+        write_new(&marker_path(&self.root), format!("{id}\n").as_bytes())
+            .await
+            .context("写入恢复工作区 UUID 失败")?;
+        state.activate(id).await?;
+        println!("已恢复试验 {:?} ({id})", target.name);
+        Ok(())
+    }
+
+    async fn check_replacement(
+        &self,
+        existing: bool,
+        current: Option<&PlaygroundRecord>,
+        force: bool,
+        action: &str,
+    ) -> Result<()> {
+        if let Some(record) = current {
+            self.verify_current(record.id).await?;
+        } else if existing && !force && !worktree_is_empty(&self.root).await? {
+            bail!(
+                "{} 包含未登记的项目。确认丢弃后可运行 cargo-play {action} --force。",
+                self.root.display()
+            );
+        }
+        Ok(())
+    }
+
+    async fn replace_worktree(
+        &self,
+        state: &State,
+        staging: TempDir,
+        existing: bool,
+        current: Option<&PlaygroundRecord>,
+        new: Option<(Uuid, &str)>,
+    ) -> Result<()> {
+        let next = staging.path().join("next");
+        let mut changes = WorkspaceChanges::default();
+        let result = async {
+            let archive = if let Some(record) = current {
                 let old = Worktree::open(&self.root).await?;
                 old.backup().await?;
                 if old.has_changes().await? {
                     bail!("备份后工作区仍有改动，请运行 git status 检查后重试。");
                 }
-                old.bundle(&staging.path().join("next.bundle"), &next)
+                let verify_in = if new.is_some() { &next } else { &self.root };
+                old.bundle(&staging.path().join("next.bundle"), verify_in)
                     .await?;
                 Some(ArchiveRecord {
                     id: record.id,
@@ -124,9 +218,10 @@ impl Playground {
                 None
             };
 
-            let txn = state
-                .stage_switch(id, display_name, archive.as_ref())
-                .await?;
+            let txn = match new {
+                Some((id, name)) => state.stage_switch(id, name, archive.as_ref()).await?,
+                None => state.stage_clear(archive.as_ref()).await?,
+            };
             changes
                 .switch_worktree(&self.root, staging.path(), &next, existing, rename_entry)
                 .await?;
@@ -143,10 +238,6 @@ impl Playground {
                     archive.id,
                     self.home.join(archive.path).display()
                 );
-            }
-            println!("已创建试验 {display_name:?} ({id})");
-            if !deps.is_empty() {
-                println!("已提交依赖 {}", deps.join(", "));
             }
             Ok(())
         }

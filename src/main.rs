@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
 use jiff::{Zoned, tz::TimeZone};
 use repository::{Playground, directory_exists};
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(version, about = "用 Git Bundle 归档 Rust 试验")]
@@ -32,6 +33,15 @@ enum Action {
         /// 游乐场名称，默认使用生成的 Cargo 包名
         #[arg(long, value_name = "名称", value_parser = clap::builder::NonEmptyStringValueParser::new())]
         name: Option<String>,
+        /// 允许替换未登记的旧工作区
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// 归档当前试验，按 UUID 恢复游乐场并打开项目文件夹
+    Resume {
+        /// 游乐场 UUID，可通过 list 查看
+        #[arg(value_name = "UUID")]
+        id: Uuid,
         /// 允许替换未登记的旧工作区
         #[arg(short, long)]
         force: bool,
@@ -79,18 +89,20 @@ async fn run(
         }
         Action::Open => {
             let folder = config::resolve_home(home)?.join("play");
-            ensure!(
-                directory_exists(&folder).await?,
-                "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cargo-play init。",
-                folder.display()
-            );
-            open_with_warning(&folder, open).await;
+            open_play_folder(&folder, open).await?;
         }
         Action::Backup => Playground::open(home, false).await?.backup().await?,
         Action::List => {
             let home = config::resolve_home(home)?;
             let table = list_playgrounds(&home, &TimeZone::system()).await?;
             println!("{table}");
+        }
+        Action::Resume { id, force } => {
+            let playground = Playground::open(home, false).await?;
+            playground.resume(id, force).await?;
+            let folder = playground.root.clone();
+            drop(playground);
+            open_play_folder(&folder, open).await?;
         }
         Action::New { deps, name, force } => {
             let playground = Playground::open(home, true).await?;
@@ -135,6 +147,19 @@ async fn list_playgrounds(home: &Path, time_zone: &TimeZone) -> Result<String> {
         table.add_row([alias, entry.id.to_string(), date]);
     }
     Ok(table.to_string())
+}
+
+async fn open_play_folder(
+    folder: &Path,
+    open: impl AsyncFnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        directory_exists(folder).await?,
+        "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cargo-play init。",
+        folder.display()
+    );
+    open_with_warning(folder, open).await;
+    Ok(())
 }
 
 async fn open_with_warning(folder: &Path, open: impl AsyncFnOnce(&Path) -> Result<()>) {
