@@ -7,7 +7,7 @@ mod workspace;
 mod worktree;
 
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::{File, OpenOptions, TryLockError},
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -23,9 +23,9 @@ use crate::{
 };
 
 pub use filesystem::directory_exists;
-use filesystem::{close_tempdir, temporary_dir, write_new};
-use process::{checked, git};
-use worktree::Worktree;
+use filesystem::{close_tempdir, rename_entry, temporary_dir, write_new};
+use workspace::WorkspaceChanges;
+use worktree::{Worktree, restore_bundle};
 
 const MANAGED_MARKER: &str = "cargo-play.bundle-worktree";
 
@@ -157,27 +157,24 @@ impl Playground {
         self.archive_and_clear(&state, current.as_ref(), force, "resume")
             .await?;
 
-        // Clearing the active record first keeps the previous project available in history
-        // if Git cannot clone the requested bundle.
         let bundle = self.home.join(bundle);
-        checked(
-            "git clone",
-            git(
-                &self.home,
-                [
-                    OsStr::new("clone"),
-                    OsStr::new("--"),
-                    bundle.as_os_str(),
-                    self.root.as_os_str(),
-                ],
-            )
-            .await?,
-        )
-        .with_context(|| format!("从 Bundle 恢复游乐场 {id} 失败"))?;
-        write_new(&marker_path(&self.root), format!("{id}\n").as_bytes())
-            .await
-            .context("写入恢复工作区 UUID 失败")?;
-        state.activate(id).await?;
+        let staging = temporary_dir(Some(&self.home), ".cargo-play-resume-").await?;
+        let next = staging.path().join("next");
+        let mut changes = WorkspaceChanges::default();
+        let result = async {
+            restore_bundle(&self.home, &bundle, &next)
+                .await
+                .with_context(|| format!("从 Bundle 恢复游乐场 {id} 失败"))?;
+            write_new(&marker_path(&next), format!("{id}\n").as_bytes())
+                .await
+                .context("写入恢复工作区 UUID 失败")?;
+            changes
+                .switch_worktree(&self.root, staging.path(), &next, true, rename_entry)
+                .await?;
+            state.activate(id).await
+        }
+        .await;
+        changes.finish(staging, result).await?;
         println!("已恢复试验 {:?} ({id})", target.name);
         Ok(())
     }

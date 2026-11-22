@@ -50,13 +50,13 @@ impl Playground {
         let result = async {
             let archive = if let Some(record) = current {
                 let old = Worktree::open(&self.root).await?;
-                old.backup().await?;
-                if old.has_changes().await? {
-                    bail!("备份后工作区仍有改动，请运行 git status 检查后重试。");
-                }
                 let verify_in = if new.is_some() { &next } else { &self.root };
-                old.bundle(&staging.path().join("next.bundle"), verify_in)
-                    .await?;
+                old.bundle(
+                    &staging.path().join("next.bundle"),
+                    verify_in,
+                    &staging.path().join("archive.index"),
+                )
+                .await?;
                 Some(ArchiveRecord {
                     id: record.id,
                     path: archive_path(record.id),

@@ -722,19 +722,8 @@ fn new_archives_git_history_and_keeps_the_registered_name() {
         &["clone", bundle.to_str().unwrap(), "restored"],
     );
     let restored = fixture.home.join("restored");
-    assert_eq!(fixture.git_at(&restored, &["rev-parse", "HEAD^"]), previous);
-    assert!(
-        fixture
-            .git_at(&restored, &["log", "-1", "--format=%s"])
-            .starts_with("backup: ")
-    );
-    assert_eq!(
-        fs::read_to_string(restored.join("note.txt")).unwrap(),
-        "latest"
-    );
-    for name in ["old.txt", "local.env", "target"] {
-        assert!(!restored.join(name).exists());
-    }
+    assert_eq!(fixture.git_at(&restored, &["rev-parse", "HEAD"]), previous);
+    assert!(!restored.join("note.txt").exists());
     for name in ["old.txt", "local.env", "target", "note.txt"] {
         assert!(!fixture.play.join(name).exists());
     }
@@ -745,6 +734,25 @@ fn new_archives_git_history_and_keeps_the_registered_name() {
     fs::write(fixture.play.join("draft.txt"), "draft").unwrap();
     fixture.run(Action::Backup, not_opened).unwrap();
     assert_eq!(fixture.git(&["show", "HEAD:draft.txt"]), "draft");
+
+    fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(id),
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), previous);
+    assert_eq!(fixture.git(&["show", ":note.txt"]), "latest");
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("note.txt")).unwrap(),
+        "latest"
+    );
+    for name in ["old.txt", "local.env", "target"] {
+        assert!(!fixture.play.join(name).exists());
+    }
 }
 
 #[test]
@@ -835,11 +843,24 @@ fn blocked_archive_publication_restores_the_original_worktree() {
     let record = fixture.active();
     let destination = fixture.home.join(format!("history/{}.bundle", record.id));
     fs::create_dir(&destination).unwrap();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    fs::write(fixture.play.join("old.txt"), "staged").unwrap();
+    fixture.git(&["add", "old.txt"]);
+    fs::write(fixture.play.join("old.txt"), "unstaged").unwrap();
+    let index = fs::read(fixture.play.join(".git/index")).unwrap();
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
     assert!(format!("{error:#}").contains("归档路径"));
     assert!(destination.is_dir());
     assert_eq!(fixture.active(), record);
-    assert!(fixture.play.join("old.txt").is_file());
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read(fixture.play.join(".git/index")).unwrap(), index);
+    assert_eq!(fixture.git(&["show", ":old.txt"]), "staged");
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("old.txt")).unwrap(),
+        "unstaged"
+    );
+    assert_eq!(fixture.git(&["for-each-ref", "refs/cargo-play"]), "");
+    assert_eq!(fixture.git(&["stash", "list"]), "");
 }
 
 #[test]
@@ -883,12 +904,16 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
         }
     });
     let record = fixture.active();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    let index = fs::read(fixture.play.join(".git/index")).unwrap();
     fs::write(fixture.play.join("updated.txt"), "new contents").unwrap();
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
     assert!(format!("{error:#}").contains("提交工作区状态失败"));
     assert_eq!(fixture.active(), record);
     assert_eq!(fs::read(&bundle).unwrap(), bytes);
-    assert!(fixture.play.join("updated.txt").is_file());
+    assert_eq!(fs::read(fixture.play.join(".git/index")).unwrap(), index);
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "?? updated.txt");
     assert_eq!(
         fs::read_dir(fixture.home.join("history")).unwrap().count(),
         1
@@ -911,12 +936,19 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
         fs::read_dir(fixture.home.join("history")).unwrap().count(),
         1
     );
-    fixture.git_at(
-        &fixture.home,
-        &["clone", bundle.to_str().unwrap(), "restored"],
-    );
+    fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(id),
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "A  updated.txt");
     assert_eq!(
-        fs::read_to_string(fixture.home.join("restored/updated.txt")).unwrap(),
+        fs::read_to_string(fixture.play.join("updated.txt")).unwrap(),
         "new contents"
     );
 }
@@ -935,6 +967,15 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
         .home
         .join(original_archive.archived_path.as_ref().unwrap());
     let bundle_contents = fs::read(&original_bundle).unwrap();
+    assert_eq!(
+        fixture.git(&[
+            "bundle",
+            "list-heads",
+            original_bundle.to_str().unwrap(),
+            "refs/cargo-play/worktree"
+        ]),
+        ""
+    );
     fs::write(fixture.play.join("draft.txt"), "other project changes").unwrap();
 
     let before_resume = Timestamp::now();
@@ -1001,7 +1042,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
         fs::read_to_string(fixture.play.join("draft.txt")).unwrap(),
         "other project changes"
     );
-    assert_eq!(fixture.git(&["status", "--porcelain"]), "");
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "A  draft.txt");
     assert_ne!(fs::read(&original_bundle).unwrap(), bundle_contents);
 
     fixture
@@ -1013,7 +1054,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
             |_| Ok(()),
         )
         .unwrap();
-    assert_eq!(fixture.git(&["rev-parse", "HEAD^"]), original_head);
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), original_head);
     assert_eq!(
         fs::read_to_string(fixture.play.join("old.txt")).unwrap(),
         "original project changes"
@@ -1145,6 +1186,9 @@ fn resuming_the_current_playground_updates_its_visit_time_and_opens_it() {
 fn clear_archives_pending_work_and_leaves_play_empty() {
     let fixture = Fixture::previous_trial();
     let id = fixture.active().id;
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    fs::write(fixture.play.join("old.txt"), "staged version").unwrap();
+    fixture.git(&["add", "old.txt"]);
     fs::write(fixture.play.join("old.txt"), "updated").unwrap();
     fs::write(fixture.play.join("draft.txt"), "untracked draft").unwrap();
 
@@ -1178,6 +1222,8 @@ fn clear_archives_pending_work_and_leaves_play_empty() {
         )
         .unwrap();
     assert_eq!(fixture.active().id, id);
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fixture.git(&["show", ":old.txt"]), "updated");
     assert_eq!(
         fs::read_to_string(fixture.play.join("old.txt")).unwrap(),
         "updated"
@@ -1336,6 +1382,66 @@ fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
 }
 
 #[test]
+fn failed_snapshot_apply_leaves_play_empty_and_the_previous_project_recoverable() {
+    let fixture = Fixture::previous_trial();
+    let target = fixture.active();
+    let bundle = fixture.home.join(format!("history/{}.bundle", target.id));
+    let backup = fixture.home.join("invalid-snapshot.bundle");
+    let snapshot_ref = "refs/cargo-play/worktree";
+    // Advertise an ordinary commit as the snapshot so cloning works but stash apply fails.
+    fixture.git(&["update-ref", snapshot_ref, "HEAD"]);
+    fixture.git(&[
+        "bundle",
+        "create",
+        backup.to_str().unwrap(),
+        "HEAD",
+        "refs/heads/archive",
+        snapshot_ref,
+    ]);
+    fixture.git(&["update-ref", "-d", snapshot_ref]);
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    fs::copy(&backup, &bundle).unwrap();
+    let archived_target = fixture.record(target.id);
+    let previous = fixture.active();
+    fs::write(fixture.play.join("draft.txt"), "keep").unwrap();
+
+    let error = fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(target.id),
+                force: false,
+            },
+            not_opened,
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("git stash"), "{error:#}");
+    assert_eq!(fixture.record(target.id), archived_target);
+    assert_eq!(fs::read_dir(&fixture.play).unwrap().count(), 0);
+    block_on(async {
+        assert!(
+            State::open_existing(&fixture.home)
+                .await
+                .unwrap()
+                .active()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+    fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(previous.id),
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.active().id, previous.id);
+    assert_eq!(fixture.git(&["show", ":draft.txt"]), "keep");
+}
+
+#[test]
 fn checks_git_operations() {
     let fixture = Fixture::previous_trial();
     let head = fixture.git(&["rev-parse", "HEAD"]);
@@ -1419,12 +1525,69 @@ fn failed_backup_preserves_staged_work() {
     fs::write(fixture.play.join("draft.txt"), "keep").unwrap();
     assert!(
         fixture
-            .run(new(&[]), not_opened)
+            .run(Action::Backup, not_opened)
             .unwrap_err()
             .to_string()
             .contains("备份失败")
     );
     assert_eq!(fixture.git(&["status", "--porcelain"]), "A  draft.txt");
+    fixture.assert_no_archives();
+}
+
+#[test]
+fn clear_archives_untracked_files_without_running_a_commit() {
+    let fixture = Fixture::previous_trial();
+    let id = fixture.active().id;
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.fail_commits();
+    fs::write(fixture.play.join("draft.txt"), "keep").unwrap();
+    fixture
+        .run(Action::Clear { force: false }, not_opened)
+        .unwrap();
+    fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(id),
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "A  draft.txt");
+    assert_eq!(fixture.git(&["show", ":draft.txt"]), "keep");
+}
+
+#[test]
+fn snapshot_ref_collision_preserves_the_existing_ref_and_worktree() {
+    let fixture = Fixture::previous_trial();
+    let record = fixture.active();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    let snapshot_ref = "refs/cargo-play/worktree";
+    fixture.git(&["update-ref", snapshot_ref, &head]);
+    fs::write(fixture.play.join("draft.txt"), "keep").unwrap();
+    let error = fixture
+        .run(Action::Clear { force: false }, not_opened)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("创建临时归档引用失败"));
+    assert_eq!(fixture.git(&["rev-parse", snapshot_ref]), head);
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
+    assert_eq!(fixture.active(), record);
+    fixture.assert_no_archives();
+}
+
+#[test]
+fn clear_requires_a_base_commit_for_the_snapshot() {
+    let fixture = Fixture::previous_trial();
+    let record = fixture.active();
+    fixture.git(&["symbolic-ref", "HEAD", "refs/heads/unborn"]);
+    let error = fixture
+        .run(Action::Clear { force: false }, not_opened)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("没有有效的 HEAD"));
+    assert_eq!(fixture.git(&["symbolic-ref", "HEAD"]), "refs/heads/unborn");
+    assert_eq!(fixture.active(), record);
+    assert!(fixture.play.join("old.txt").is_file());
     fixture.assert_no_archives();
 }
 

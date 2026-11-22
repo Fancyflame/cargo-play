@@ -69,7 +69,7 @@ pub(super) async fn git_line(root: &Path, args: &[&str]) -> Result<String> {
     line(git_ok(root, args).await?)
 }
 
-fn line(bytes: Vec<u8>) -> Result<String> {
+pub(super) fn line(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes)
         .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
         .context("Git 文本输出不是 UTF-8")

@@ -1,20 +1,69 @@
 //! 管理 Git 工作树，包括状态校验、备份和归档，以及 Cargo 项目初始化和依赖添加。
 
-use std::{ffi::OsStr, path::Path, process::Stdio};
+use std::{ffi::OsStr, io::ErrorKind, path::Path, process::Stdio};
 
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::AsyncWriteExt, process::Command};
 
 use super::{
     filesystem::{
         close_tempdir, directory_exists, entry_names, is_reparse_point, temporary_dir, write_new,
     },
-    process::{checked, command, command_error, git, git_line, git_ok, run_command},
+    process::{checked, command, command_error, git, git_line, git_ok, line, run_command},
 };
 
 const TARGET_PATHSPEC: &str = ":(top,icase)target";
 const EXCLUDE_TARGET: &str = ":(top,icase,exclude)target";
+const SNAPSHOT_REF: &str = "refs/cargo-play/worktree";
+
+pub(super) async fn restore_bundle(home: &Path, bundle: &Path, destination: &Path) -> Result<()> {
+    let bundle = bundle.as_os_str();
+    checked(
+        "git clone",
+        git(
+            home,
+            [
+                OsStr::new("clone"),
+                OsStr::new("--"),
+                bundle,
+                destination.as_os_str(),
+            ],
+        )
+        .await?,
+    )?;
+    let snapshot = checked(
+        "git bundle list-heads",
+        git(
+            destination,
+            [
+                OsStr::new("bundle"),
+                OsStr::new("list-heads"),
+                bundle,
+                OsStr::new(SNAPSHOT_REF),
+            ],
+        )
+        .await?,
+    )?;
+    if !snapshot.is_empty() {
+        checked(
+            "git fetch",
+            git(
+                destination,
+                [
+                    OsStr::new("fetch"),
+                    OsStr::new("--no-tags"),
+                    OsStr::new("--"),
+                    bundle,
+                    OsStr::new(SNAPSHOT_REF),
+                ],
+            )
+            .await?,
+        )?;
+        git_ok(destination, &["stash", "apply", "--index", "FETCH_HEAD"]).await?;
+    }
+    Ok(())
+}
 
 pub(super) async fn worktree_is_empty(root: &Path) -> Result<bool> {
     let entries = entry_names(root).await?;
@@ -117,11 +166,27 @@ impl<'a> Worktree<'a> {
         Ok(Self { root })
     }
 
-    pub(super) async fn bundle(&self, path: &Path, verify_in: &Path) -> Result<()> {
+    pub(super) async fn bundle(&self, path: &Path, verify_in: &Path, index: &Path) -> Result<()> {
         if git_line(self.root, &["rev-parse", "--is-shallow-repository"]).await? == "true" {
             bail!("浅克隆仓库无法归档为完整 Bundle，请先补全 Git 历史。");
         }
+        git_ok(self.root, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await
+            .context("当前分支没有有效的 HEAD，无法归档。请先提交一次。")?;
         let branch = git_line(self.root, &["symbolic-ref", "HEAD"]).await?;
+        let snapshot = if self.has_changes().await? {
+            let oid = self.snapshot(index).await.context("生成工作区快照失败")?;
+            // An empty old value allows creation only if the ref does not already exist.
+            git_ok(
+                self.root,
+                &["update-ref", "--no-deref", SNAPSHOT_REF, &oid, ""],
+            )
+            .await
+            .context("创建临时归档引用失败")?;
+            Some(oid)
+        } else {
+            None
+        };
         let bundle = |operation| {
             [
                 OsStr::new("bundle"),
@@ -129,16 +194,30 @@ impl<'a> Worktree<'a> {
                 path.as_os_str(),
             ]
         };
-        checked(
-            "git bundle create",
-            git(
+        let created = git(
+            self.root,
+            bundle("create")
+                .into_iter()
+                .chain([OsStr::new("HEAD"), OsStr::new(&branch)])
+                .chain(snapshot.as_ref().map(|_| OsStr::new(SNAPSHOT_REF))),
+        )
+        .await
+        .and_then(|output| checked("git bundle create", output));
+        if let Some(oid) = snapshot {
+            let removed = git_ok(
                 self.root,
-                bundle("create")
-                    .into_iter()
-                    .chain([OsStr::new("HEAD"), OsStr::new(&branch)]),
+                &["update-ref", "--no-deref", "-d", SNAPSHOT_REF, &oid],
             )
-            .await?,
-        )?;
+            .await
+            .context("删除临时归档引用失败");
+            if let Err(cleanup) = removed {
+                return Err(match created {
+                    Ok(_) => cleanup,
+                    Err(error) => error.context(format!("{cleanup:#}")),
+                });
+            }
+        }
+        created?;
         checked("git bundle verify", git(verify_in, bundle("verify")).await?)?;
         async {
             fs::OpenOptions::new()
@@ -153,21 +232,64 @@ impl<'a> Worktree<'a> {
         Ok(())
     }
 
+    async fn snapshot(&self, index: &Path) -> Result<String> {
+        match fs::copy(self.root.join(".git/index"), index).await {
+            Ok(_) => (),
+            Err(error) if error.kind() == ErrorKind::NotFound => (),
+            Err(error) => return Err(error).context("复制 Git 索引失败"),
+        }
+        self.stage_backup(Some(index)).await?;
+        // A dirty submodule can still have the same gitlink after staging.
+        let unstaged = self
+            .indexed_git(
+                &[
+                    "diff",
+                    "--quiet",
+                    "--ignore-submodules=none",
+                    "--",
+                    ".",
+                    EXCLUDE_TARGET,
+                ],
+                Some(index),
+            )
+            .output()
+            .await
+            .context("无法执行 git diff")?;
+        if unstaged.status.code() == Some(1) {
+            bail!("暂存后仍有改动，请检查子模块和工作区后重试。");
+        }
+        checked("git diff", unstaged)?;
+        let output = self
+            .indexed_git(&["stash", "create", "cargo-play archive"], Some(index))
+            .output()
+            .await
+            .context("无法执行 git stash create")?;
+        let oid = line(checked("git stash create", output)?)?;
+        if oid.is_empty() {
+            bail!("工作区有改动，但未生成 stash 快照。请运行 git status 检查后重试。");
+        }
+        Ok(oid)
+    }
+
     pub(super) async fn has_changes(&self) -> Result<bool> {
-        Ok(!git_ok(
-            self.root,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=none",
-                "--",
-                ".",
-                EXCLUDE_TARGET,
-            ],
-        )
-        .await?
+        Ok(!checked(
+            "git status",
+            git(
+                self.root,
+                [
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none",
+                    "--",
+                    ".",
+                    EXCLUDE_TARGET,
+                ],
+            )
+            .await?,
+        )?
         .is_empty())
     }
 
@@ -179,7 +301,7 @@ impl<'a> Worktree<'a> {
         let timestamp = Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ");
         let message = format!("backup: {timestamp}");
         async {
-            self.stage_backup().await?;
+            self.stage_backup(None).await?;
             git_ok(self.root, &["commit", "-m", &message]).await
         }
         .await
@@ -188,41 +310,53 @@ impl<'a> Worktree<'a> {
         Ok(())
     }
 
-    async fn stage_backup(&self) -> Result<()> {
+    fn indexed_git(&self, args: &[&str], index: Option<&Path>) -> Command {
+        let mut command = command(self.root, "git", args);
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        command
+    }
+
+    async fn stage_backup(&self, index: Option<&Path>) -> Result<()> {
         // Enumerate paths first: git add reports an ignored target as an error even with an exclusion pathspec.
-        let paths = git_ok(
-            self.root,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "--",
-                ".",
-                EXCLUDE_TARGET,
-            ],
-        )
-        .await?;
+        let output = self
+            .indexed_git(
+                &[
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    ".",
+                    EXCLUDE_TARGET,
+                ],
+                index,
+            )
+            .output()
+            .await
+            .context("无法执行 git ls-files")?;
+        let paths = checked("git ls-files", output)?;
         if paths.is_empty() {
             return Ok(());
         }
-        let mut child = command(
-            self.root,
-            "git",
-            [
-                "--literal-pathspecs",
-                "add",
-                "-A",
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-            ],
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("无法执行 git add")?;
+        let mut child = self
+            .indexed_git(
+                &[
+                    "--literal-pathspecs",
+                    "add",
+                    "-A",
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                ],
+                index,
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("无法执行 git add")?;
         let mut stdin = child.stdin.take().expect("piped git stdin");
         let (sent, output) = tokio::join!(
             async move { stdin.write_all(&paths).await },
