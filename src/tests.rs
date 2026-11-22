@@ -84,7 +84,7 @@ impl Fixture {
     ) -> crate::Result<()> {
         let repo = open_repo(
             Some(self.home.clone().into_os_string()),
-            matches!(&action, Action::New { .. }),
+            matches!(&action, Action::Init | Action::New { .. }),
         )?;
         run(action, repo, open)
     }
@@ -170,7 +170,10 @@ fn first_use_creates_nested_repository_and_config_and_preserves_targets() {
         fs::write(target.join("keep.txt"), "keep").unwrap();
     }
     // Bootstrap separately so the test can set a repository-local Git identity.
-    drop(open_repo(Some(fixture.home.clone().into_os_string()), true).unwrap());
+    fixture.run(Action::Init, not_opened).unwrap();
+    fixture.run(Action::Init, not_opened).unwrap();
+    assert_eq!(fixture.git(&["symbolic-ref", "--short", "HEAD"]), "archive");
+    assert!(!fixture.play.join("Cargo.toml").exists());
     fixture.git(&["config", "user.name", "Cargo Play Test"]);
     fixture.git(&["config", "user.email", "test@example.com"]);
     fixture.git(&["config", "commit.gpgsign", "false"]);

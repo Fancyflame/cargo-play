@@ -37,7 +37,7 @@ impl Repository {
         }
         if !git_dir.is_dir() {
             return Err(format!(
-                "{} 必须包含独立的 .git 目录。首次使用请运行 cargo-play new。",
+                "{} 必须包含独立的 .git 目录。首次使用请运行 cargo-play init。",
                 root.display()
             ));
         }

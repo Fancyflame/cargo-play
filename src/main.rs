@@ -17,6 +17,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// 初始化 CARGOPLAY_HOME 下的配置和 play 仓库
+    Init,
     /// 备份上一次试验，用 cargo init 创建新试验并打开 src/main.rs
     New {
         /// 依赖列表，支持 crate 名和 crate@版本
@@ -33,7 +35,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = Repository::open(
         env::var_os("CARGOPLAY_HOME"),
-        matches!(&cli.command, Action::New { .. }),
+        matches!(&cli.command, Action::Init | Action::New { .. }),
         config::prepare_global,
     )
     .and_then(|repo| run(cli.command, repo, editor::open));
@@ -50,6 +52,7 @@ fn run(action: Action, repo: Repository, open: impl FnOnce(&Path) -> Result<()>)
     let now = Utc::now();
     let timestamp = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     match action {
+        Action::Init => println!("试验仓库已就绪：{}", repo.root.display()),
         Action::Backup => {
             repo.backup(&timestamp)?;
         }
