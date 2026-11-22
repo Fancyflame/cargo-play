@@ -4,7 +4,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::Result;
+use anyhow::{Context, Result, ensure};
 
 pub fn open_folder(folder: &Path) -> Result<()> {
     if let Some(code) = find_code() {
@@ -20,7 +20,7 @@ pub fn open_folder(folder: &Path) -> Result<()> {
             Ok(_) => return Ok(()),
             Err(error) => {
                 return open_association(folder)
-                    .map_err(|fallback| format!("启动 VS Code 失败（{error}）。{fallback}"));
+                    .with_context(|| format!("启动 VS Code 失败（{error}）"));
             }
         }
     }
@@ -75,14 +75,12 @@ fn open_association(folder: &Path) -> Result<()> {
             SW_SHOWNORMAL,
         )
     };
-    if result as isize > 32 {
-        Ok(())
-    } else {
-        Err(format!(
-            "无法使用 Windows 默认应用打开文件夹（ShellExecuteW 返回 {}）。",
-            result as isize
-        ))
-    }
+    ensure!(
+        result as isize > 32,
+        "无法使用 Windows 默认应用打开文件夹（ShellExecuteW 返回 {}）。",
+        result as isize
+    );
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -95,10 +93,7 @@ fn open_association(folder: &Path) -> Result<()> {
     let status = Command::new(opener)
         .arg(folder)
         .status()
-        .map_err(|error| format!("无法启动 {opener}：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{opener} 退出失败（{status}）。"))
-    }
+        .with_context(|| format!("无法启动 {opener}"))?;
+    ensure!(status.success(), "{opener} 退出失败（{status}）。");
+    Ok(())
 }

@@ -7,12 +7,12 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+use anyhow::{Context, Error, Result, anyhow, bail};
 use jiff::Timestamp;
 use serde::Deserialize;
 use tempfile::TempDir;
 
 use crate::{
-    Result,
     config::resolve_home,
     history::{History, check_package_name},
 };
@@ -35,10 +35,9 @@ impl Playground {
     ) -> Result<Self> {
         let home = resolve_home(home)?;
         if create {
-            fs::create_dir_all(&home)
-                .map_err(|error| format!("创建 {} 失败：{error}", home.display()))?;
+            fs::create_dir_all(&home).with_context(|| format!("创建 {} 失败", home.display()))?;
         } else if !home.is_dir() {
-            return Err("首次使用请运行 cargo-play init。".into());
+            bail!("首次使用请运行 cargo-play init。");
         }
         let _lock = lock_home(&home)?;
         prepare_config(&home, create)?;
@@ -50,7 +49,7 @@ impl Playground {
         History::open(&self.home)?;
         if !directory_exists(&self.root)? {
             fs::create_dir(&self.root)
-                .map_err(|error| format!("创建 {} 失败：{error}", self.root.display()))?;
+                .with_context(|| format!("创建 {} 失败", self.root.display()))?;
         }
         let git_dir = self.root.join(".git");
         if directory_exists(&git_dir)? && git_dir.join("HEAD").is_file() {
@@ -72,10 +71,10 @@ impl Playground {
                 Ok(name) => Some(name),
                 Err(_) if force || worktree_is_empty(&self.root)? => None,
                 Err(error) => {
-                    return Err(format!(
-                        "{error}\n{} 包含旧项目内容。确认丢弃后可运行 cargo-play new --force。",
+                    return Err(error.context(format!(
+                        "{} 包含旧项目内容。确认丢弃后可运行 cargo-play new --force。",
                         self.root.display()
-                    ));
+                    )));
                 }
             }
         } else {
@@ -92,9 +91,9 @@ impl Playground {
         let staging = tempfile::Builder::new()
             .prefix(".cargo-play-new-")
             .tempdir_in(&self.home)
-            .map_err(|error| format!("创建新工程临时目录失败：{error}"))?;
+            .context("创建新工程临时目录失败")?;
         let next = staging.path().join("next");
-        fs::create_dir(&next).map_err(|error| format!("创建新工作区失败：{error}"))?;
+        fs::create_dir(&next).context("创建新工作区失败")?;
         let fresh = Worktree::init(&next)?;
         fresh.init_project(&package)?;
         if !deps.is_empty() {
@@ -104,7 +103,7 @@ impl Playground {
         if let (Some(old), Some(name)) = (old, previous_name) {
             old.backup()?;
             if old.has_changes()? {
-                return Err("备份后工作区仍有改动，请运行 git status 检查后重试。".into());
+                bail!("备份后工作区仍有改动，请运行 git status 检查后重试。");
             }
             let bundle = history.archive(&name, |path| old.bundle(path, &next))?;
             println!("已归档 {name} 到 {}", bundle.display());
@@ -121,18 +120,20 @@ impl Playground {
         let previous = staging.path().join("previous");
         if existing {
             fs::rename(&self.root, &previous)
-                .map_err(|error| format!("移开原工作区 {} 失败：{error}", self.root.display()))?;
+                .with_context(|| format!("移开原工作区 {} 失败", self.root.display()))?;
         }
         if let Err(error) = fs::rename(next, &self.root) {
             if existing && let Err(restore) = fs::rename(&previous, &self.root) {
                 // Keep the old directory even when Windows refuses to move it back.
                 let kept = staging.keep().join("previous");
-                return Err(format!(
-                    "启用新工作区失败：{error}\n恢复原工作区失败：{restore}\n原工作区保留在 {}",
-                    kept.display()
-                ));
+                return Err(error).with_context(|| {
+                    format!(
+                        "启用新工作区失败，恢复原工作区也失败（{restore}），原工作区保留在 {}",
+                        kept.display()
+                    )
+                });
             }
-            return Err(format!("启用新工作区失败：{error}"));
+            return Err(error).context("启用新工作区失败");
         }
         let cleanup_path = staging.path().to_owned();
         if let Err(error) = staging.close() {
@@ -149,23 +150,22 @@ pub fn directory_exists(path: &Path) -> Result<bool> {
             {
                 use std::os::windows::fs::MetadataExt;
                 if info.file_attributes() & 0x400 != 0 {
-                    return Err(format!("{} 必须是独立的目录。", path.display()));
+                    bail!("{} 必须是独立的目录。", path.display());
                 }
             }
             Ok(true)
         }
-        Ok(_) => Err(format!("{} 必须是独立的目录。", path.display())),
+        Ok(_) => bail!("{} 必须是独立的目录。", path.display()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!("检查 {} 失败：{error}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("检查 {} 失败", path.display())),
     }
 }
 
 fn worktree_is_empty(root: &Path) -> Result<bool> {
-    let entries =
-        fs::read_dir(root).map_err(|error| format!("读取 {} 失败：{error}", root.display()))?;
+    let entries = fs::read_dir(root).with_context(|| format!("读取 {} 失败", root.display()))?;
     let mut has_git = false;
     for entry in entries {
-        let entry = entry.map_err(|error| format!("读取 {} 失败：{error}", root.display()))?;
+        let entry = entry.with_context(|| format!("读取 {} 失败", root.display()))?;
         if entry.file_name() != ".git" {
             return Ok(false);
         }
@@ -197,9 +197,9 @@ fn package_name(root: &Path) -> Result<String> {
 
     let path = root.join("Cargo.toml");
     let manifest = fs::read_to_string(&path)
-        .map_err(|error| format!("读取 {} 的 [package].name 失败：{error}", path.display()))?;
+        .with_context(|| format!("读取 {} 的 [package].name 失败", path.display()))?;
     let manifest: Manifest = toml::from_str(manifest.trim_start_matches('\u{feff}'))
-        .map_err(|error| format!("解析 {} 的 [package].name 失败：{error}", path.display()))?;
+        .with_context(|| format!("解析 {} 的 [package].name 失败", path.display()))?;
     check_package_name(&manifest.package.name)?;
     Ok(manifest.package.name)
 }
@@ -212,26 +212,26 @@ impl<'a> Worktree<'a> {
     fn init(root: &'a Path) -> Result<Self> {
         git_ok(root, &["init", "--initial-branch=archive"])?;
         write_new(&root.join(".git").join(MANAGED_MARKER), b"1\n")
-            .map_err(|error| format!("写入新工作区标记失败：{error}"))?;
+            .context("写入新工作区标记失败")?;
         Self::open(root)
     }
 
     fn open(root: &'a Path) -> Result<Self> {
         let git_dir = root.join(".git");
         if !directory_exists(root)? || !directory_exists(&git_dir)? {
-            return Err(format!(
+            bail!(
                 "{} 必须包含独立的 .git 目录。首次使用请运行 cargo-play init。",
                 root.display()
-            ));
+            );
         }
         let top = git_line(root, &["rev-parse", "--show-toplevel"])
-            .map_err(|error| format!("{} 不是可用的 Git 工作区：{error}", root.display()))?;
+            .with_context(|| format!("{} 不是可用的 Git 工作区", root.display()))?;
         let canonical = |path: &Path| {
             path.canonicalize()
-                .map_err(|error| format!("解析 {} 失败：{error}", path.display()))
+                .with_context(|| format!("解析 {} 失败", path.display()))
         };
         if canonical(root)? != canonical(Path::new(&top))? {
-            return Err(format!("{} 必须是独立的 Git 仓库根目录。", root.display()));
+            bail!("{} 必须是独立的 Git 仓库根目录。", root.display());
         }
 
         for marker in [
@@ -246,17 +246,15 @@ impl<'a> Worktree<'a> {
             if git_dir
                 .join(marker)
                 .try_exists()
-                .map_err(|error| format!("检查 Git 状态失败：{error}"))?
+                .context("检查 Git 状态失败")?
             {
-                return Err(format!(
-                    "有未完成的 Git 操作（{marker}），请先完成或中止该操作。"
-                ));
+                bail!("有未完成的 Git 操作（{marker}），请先完成或中止该操作。");
             }
         }
         let head = git(root, ["symbolic-ref", "--quiet", "HEAD"])?;
         match head.status.code() {
             Some(0) => (),
-            Some(1) => return Err("当前处于分离 HEAD，请先切换到本地分支。".into()),
+            Some(1) => bail!("当前处于分离 HEAD，请先切换到本地分支。"),
             _ => return Err(command_error("git symbolic-ref", &head)),
         }
         let staged_target = !git_ok(root, &["ls-files", "-z", "--", TARGET_PATHSPEC])?.is_empty();
@@ -269,14 +267,16 @@ impl<'a> Worktree<'a> {
             _ => return Err(command_error("git rev-parse", &committed)),
         };
         if staged_target || committed_target {
-            return Err("Git 正在跟踪 target。请先通过 git rm -r --cached -- target 取消跟踪并提交，以保留磁盘文件。".into());
+            bail!(
+                "Git 正在跟踪 target。请先通过 git rm -r --cached -- target 取消跟踪并提交，以保留磁盘文件。"
+            );
         }
         Ok(Self { root })
     }
 
     fn bundle(&self, path: &Path, verify_in: &Path) -> Result<()> {
         if git_line(self.root, &["rev-parse", "--is-shallow-repository"])? == "true" {
-            return Err("浅克隆仓库无法归档为完整 Bundle，请先补全 Git 历史。".into());
+            bail!("浅克隆仓库无法归档为完整 Bundle，请先补全 Git 历史。");
         }
         let branch = git_line(self.root, &["symbolic-ref", "HEAD"])?;
         let bundle = |operation| {
@@ -300,7 +300,7 @@ impl<'a> Worktree<'a> {
             .write(true)
             .open(path)
             .and_then(|file| file.sync_all())
-            .map_err(|error| format!("同步 Bundle {} 失败：{error}", path.display()))?;
+            .with_context(|| format!("同步 Bundle {} 失败", path.display()))?;
         Ok(())
     }
 
@@ -330,9 +330,7 @@ impl<'a> Worktree<'a> {
         let message = format!("backup: {timestamp}");
         self.stage_backup()
             .and_then(|_| git_ok(self.root, &["commit", "-m", &message]))
-            .map_err(|error| {
-                format!("备份失败，已保留当前工作区。请运行 git status 检查现场。\n{error}")
-            })?;
+            .context("备份失败，已保留当前工作区。请运行 git status 检查现场。")?;
         println!("已提交 {message}");
         Ok(())
     }
@@ -370,23 +368,20 @@ impl<'a> Worktree<'a> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("无法执行 git add：{error}"))?;
+        .context("无法执行 git add")?;
         let sent = child
             .stdin
             .take()
             .expect("piped git stdin")
             .write_all(&paths);
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("等待 git add 失败：{error}"))?;
+        let output = child.wait_with_output().context("等待 git add 失败")?;
         checked("git add", output)?;
-        sent.map_err(|error| format!("发送备份文件列表失败：{error}"))
+        sent.context("发送备份文件列表失败")
     }
 
     fn init_project(&self, package: &str) -> Result<()> {
         // Generate in an isolated directory so Cargo cannot adopt leftovers or edit a parent workspace.
-        let scaffold =
-            tempfile::tempdir().map_err(|error| format!("创建临时工程目录失败：{error}"))?;
+        let scaffold = tempfile::tempdir().context("创建临时工程目录失败")?;
         let args = [
             "init",
             "--vcs",
@@ -401,28 +396,25 @@ impl<'a> Worktree<'a> {
         run_command(scaffold.path(), "cargo", args)
             .and_then(|output| checked("cargo init", output))?;
 
-        let mut manifest = fs::read(scaffold.path().join("Cargo.toml"))
-            .map_err(|error| format!("读取新工程的 Cargo.toml 失败：{error}"))?;
+        let mut manifest =
+            fs::read(scaffold.path().join("Cargo.toml")).context("读取新工程的 Cargo.toml 失败")?;
         manifest.extend_from_slice(b"\n[workspace]\n");
         let main = fs::read(scaffold.path().join("src/main.rs"))
-            .map_err(|error| format!("读取新工程的 src/main.rs 失败：{error}"))?;
+            .context("读取新工程的 src/main.rs 失败")?;
 
-        fs::create_dir(self.root.join("src"))
-            .map_err(|error| format!("创建工程的 src 目录失败：{error}"))?;
+        fs::create_dir(self.root.join("src")).context("创建工程的 src 目录失败")?;
         for (name, data) in [
             ("Cargo.toml", manifest.as_slice()),
             ("src/main.rs", main.as_slice()),
             (".gitignore", b"/target/\n"),
         ] {
-            write_new(&self.root.join(name), data)
-                .map_err(|error| format!("写入 {name} 失败：{error}"))?;
+            write_new(&self.root.join(name), data).with_context(|| format!("写入 {name} 失败"))?;
         }
         git_ok(
             self.root,
             &["add", "-f", "--", ".gitignore", "Cargo.toml", "src/main.rs"],
         )?;
-        git_ok(self.root, &["commit", "-m", "init: cargo init"])
-            .map_err(|error| format!("提交初始工程失败：{error}"))?;
+        git_ok(self.root, &["commit", "-m", "init: cargo init"]).context("提交初始工程失败")?;
         Ok(())
     }
 
@@ -436,19 +428,19 @@ impl<'a> Worktree<'a> {
             .root
             .join("Cargo.lock")
             .try_exists()
-            .map_err(|error| format!("检查 Cargo.lock 失败：{error}"))?;
+            .context("检查 Cargo.lock 失败")?;
         let mut paths = vec!["Cargo.toml"];
         if lock_on_disk || lock_tracked {
             paths.push("Cargo.lock");
         }
         let mut stage = vec!["add", "-A", "-f", "--"];
         stage.extend(&paths);
-        git_ok(self.root, &stage).map_err(|error| format!("暂存依赖文件失败：{error}"))?;
+        git_ok(self.root, &stage).context("暂存依赖文件失败")?;
 
         let message = format!("deps: add {}", deps.join(" "));
         let mut commit = vec!["commit", "--only", "--allow-empty", "-m", &message, "--"];
         commit.extend(paths);
-        git_ok(self.root, &commit).map_err(|error| format!("依赖提交失败：{error}"))?;
+        git_ok(self.root, &commit).context("依赖提交失败")?;
         Ok(())
     }
 }
@@ -469,13 +461,13 @@ fn lock_home(home: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(|error| format!("打开锁文件 {} 失败：{error}", path.display()))?;
+        .with_context(|| format!("打开锁文件 {} 失败", path.display()))?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => {
-            Err("试验仓库正在使用，请等另一条 cargo-play 命令结束后重试。".into())
+            bail!("试验仓库正在使用，请等另一条 cargo-play 命令结束后重试。")
         }
-        Err(TryLockError::Error(error)) => Err(format!("锁定试验仓库失败：{error}")),
+        Err(TryLockError::Error(error)) => Err(error).context("锁定试验仓库失败"),
     }
 }
 
@@ -524,7 +516,7 @@ fn run_command(
 ) -> Result<Output> {
     command(root, program, args)
         .output()
-        .map_err(|error| format!("无法执行 {program}：{error}"))
+        .with_context(|| format!("无法执行 {program}"))
 }
 
 fn git(root: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<Output> {
@@ -542,7 +534,7 @@ fn git_line(root: &Path, args: &[&str]) -> Result<String> {
 fn line(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes)
         .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
-        .map_err(|error| format!("Git 文本输出不是 UTF-8：{error}"))
+        .context("Git 文本输出不是 UTF-8")
 }
 
 fn checked(label: &str, output: Output) -> Result<Vec<u8>> {
@@ -553,7 +545,7 @@ fn checked(label: &str, output: Output) -> Result<Vec<u8>> {
     }
 }
 
-fn command_error(label: &str, output: &Output) -> String {
+fn command_error(label: &str, output: &Output) -> Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let details = [stderr.trim(), stdout.trim()]
@@ -561,9 +553,9 @@ fn command_error(label: &str, output: &Output) -> String {
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
     if details.is_empty() {
-        format!("{label} 失败（{}）", output.status)
+        anyhow!("{label} 失败（{}）", output.status)
     } else {
-        format!("{label} 失败（{}）\n{}", output.status, details.join("\n"))
+        anyhow!("{label} 失败（{}）\n{}", output.status, details.join("\n"))
     }
 }
 
@@ -585,7 +577,11 @@ mod replacement_tests {
         let staging = tempfile::tempdir_in(home.path()).unwrap();
         let missing = staging.path().join("next");
         let error = playground.replace(staging, &missing, true).unwrap_err();
-        assert!(error.contains("启用新工作区失败"), "{error}");
+        assert!(error.to_string().contains("启用新工作区失败"), "{error:#}");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::NotFound)
+        );
         assert_eq!(
             fs::read_to_string(playground.root.join("keep.txt")).unwrap(),
             "old project"

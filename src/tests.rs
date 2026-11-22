@@ -121,8 +121,8 @@ impl Fixture {
     fn run(
         &self,
         action: Action,
-        open: impl FnOnce(&Path) -> crate::Result<()>,
-    ) -> crate::Result<()> {
+        open: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         self.with_git(|| {
             run(
                 action,
@@ -190,7 +190,7 @@ pub(super) fn configure_git(command: &mut Command) {
     });
 }
 
-fn prepare_config(home: &Path, create: bool) -> crate::Result<()> {
+fn prepare_config(home: &Path, create: bool) -> anyhow::Result<()> {
     Config::read(home)?.prepare(home, create)
 }
 
@@ -201,7 +201,7 @@ fn new(deps: &[&str]) -> Action {
     }
 }
 
-fn not_opened(_: &Path) -> crate::Result<()> {
+fn not_opened(_: &Path) -> anyhow::Result<()> {
     panic!("不应打开编辑器");
 }
 
@@ -242,7 +242,7 @@ fn opens_existing_folder_directly() {
 fn open_requires_an_existing_folder() {
     let fixture = Fixture::empty();
     let error = fixture.run(Action::Open, not_opened).unwrap_err();
-    assert!(error.contains("找不到试验文件夹"));
+    assert!(error.to_string().contains("找不到试验文件夹"));
     assert!(!fixture.play.exists());
 }
 
@@ -253,6 +253,7 @@ fn init_and_first_new_create_history_and_clear_only_play() {
         fixture
             .run(Action::Backup, not_opened)
             .unwrap_err()
+            .to_string()
             .contains("首次使用")
     );
     fixture.run(Action::Init, not_opened).unwrap();
@@ -289,7 +290,14 @@ fn nonempty_play_without_manifest_requires_force_even_without_git() {
     fs::write(&cache, "preserve until forced").unwrap();
 
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
-    assert!(error.contains("Cargo.toml") && error.contains("--force"));
+    assert!(format!("{error:#}").contains("Cargo.toml"));
+    assert!(error.to_string().contains("--force"));
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::NotFound)
+    );
     assert!(cache.is_file());
 
     let cli = Cli::try_parse_from(["cargo-play", "new", "-f"]).unwrap();
@@ -312,7 +320,7 @@ fn invalid_manifest_can_be_discarded_only_after_new_project_is_ready() {
     let error = fixture
         .run(force(&["play-fixture-missing@1"]), not_opened)
         .unwrap_err();
-    assert!(error.contains("cargo add 失败"), "{error}");
+    assert!(error.to_string().contains("cargo add 失败"), "{error}");
     assert!(fixture.play.join("old.txt").is_file());
     assert_eq!(
         fs::read_to_string(fixture.play.join("Cargo.toml")).unwrap(),
@@ -467,6 +475,7 @@ fn backup_and_new_reject_tracked_target() {
             fixture
                 .run(action, not_opened)
                 .unwrap_err()
+                .to_string()
                 .contains("取消跟踪")
         );
     }
@@ -486,14 +495,16 @@ fn invalid_manifest_and_index_preserve_the_worktree() {
         fixture
             .run(new(&[]), not_opened)
             .unwrap_err()
-            .contains("归档文件名")
+            .chain()
+            .any(|cause| cause.to_string().contains("归档文件名"))
     );
     fs::write(fixture.play.join("Cargo.toml"), "invalid toml").unwrap();
     assert!(
         fixture
             .run(new(&[]), not_opened)
             .unwrap_err()
-            .contains("[package].name")
+            .chain()
+            .any(|cause| cause.to_string().contains("[package].name"))
     );
     fs::write(
         fixture.play.join("Cargo.toml"),
@@ -501,13 +512,16 @@ fn invalid_manifest_and_index_preserve_the_worktree() {
     )
     .unwrap();
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
-    assert!(error.contains("[package].name") && error.contains("--force"));
+    assert!(
+        format!("{error:#}").contains("[package].name") && error.to_string().contains("--force")
+    );
     fs::write(fixture.play.join("Cargo.toml"), MANIFEST).unwrap();
     fs::write(fixture.home.join("history-meta.json"), "[]").unwrap();
     assert!(
         fixture
             .run(new(&[]), not_opened)
             .unwrap_err()
+            .to_string()
             .contains("history-meta.json")
     );
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
@@ -523,10 +537,11 @@ fn index_write_failure_removes_only_the_unpublished_archive() {
     fs::create_dir(&index).unwrap();
     let error = history
         .archive("old-trial", |path| {
-            fs::write(path, "test archive").map_err(|error| error.to_string())
+            fs::write(path, "test archive")?;
+            Ok(())
         })
         .unwrap_err();
-    assert!(error.contains("写入"), "{error}");
+    assert!(error.to_string().contains("写入"), "{error}");
     assert!(!fixture.home.join("history/old-trial.bundle").exists());
     assert!(fixture.play.join("old.txt").is_file());
 }
@@ -541,6 +556,7 @@ fn checks_git_operations() {
         fixture
             .run(Action::Backup, not_opened)
             .unwrap_err()
+            .to_string()
             .contains("MERGE_HEAD")
     );
     fs::remove_file(marker).unwrap();
@@ -549,6 +565,7 @@ fn checks_git_operations() {
         fixture
             .run(Action::Backup, not_opened)
             .unwrap_err()
+            .to_string()
             .contains("分离 HEAD")
     );
 }
@@ -562,6 +579,7 @@ fn locks_mutating_commands_at_home() {
             fixture
                 .run(action, not_opened)
                 .unwrap_err()
+                .to_string()
                 .contains("正在使用")
         );
     }
@@ -601,6 +619,7 @@ fn failed_backup_preserves_staged_work() {
         fixture
             .run(new(&[]), not_opened)
             .unwrap_err()
+            .to_string()
             .contains("备份失败")
     );
     assert_eq!(fixture.git(&["status", "--porcelain"]), "A  draft.txt");
@@ -616,6 +635,7 @@ fn bundle_failure_preserves_the_current_project() {
         fixture
             .run(new(&[]), not_opened)
             .unwrap_err()
+            .to_string()
             .contains("浅克隆")
     );
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
@@ -631,7 +651,7 @@ fn cargo_failure_preserves_original_project_before_backup() {
     let error = fixture
         .run(new(&["play-fixture-missing@1"]), not_opened)
         .unwrap_err();
-    assert!(error.contains("cargo add 失败"), "{error}");
+    assert!(error.to_string().contains("cargo add 失败"), "{error}");
     assert_eq!(fixture.git(&["log", "--format=%s"]), "old trial");
     assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
     assert_eq!(fixture.index(), serde_json::json!({}));
@@ -641,7 +661,7 @@ fn cargo_failure_preserves_original_project_before_backup() {
 fn editor_failure_keeps_a_successful_trial() {
     let fixture = Fixture::empty();
     fixture
-        .run(new(&[]), |_| Err("测试编辑器启动失败".into()))
+        .run(new(&[]), |_| anyhow::bail!("测试编辑器启动失败"))
         .unwrap();
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
 }

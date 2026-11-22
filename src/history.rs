@@ -6,11 +6,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tempfile::{NamedTempFile, TempPath};
 
-use crate::{Result, repository::directory_exists};
+use crate::repository::directory_exists;
 
 const META_FILE: &str = "history-meta.json";
 
@@ -30,21 +31,22 @@ impl History {
     pub fn open(home: &Path) -> Result<Self> {
         let root = home.join("history");
         if !directory_exists(&root)? {
-            fs::create_dir(&root)
-                .map_err(|error| format!("创建 {} 失败：{error}", root.display()))?;
+            fs::create_dir(&root).with_context(|| format!("创建 {} 失败", root.display()))?;
         }
         let meta = home.join(META_FILE);
         let (entries, missing) = match fs::symlink_metadata(&meta) {
             Ok(info) if info.is_file() => {
-                let data = fs::read(&meta)
-                    .map_err(|error| format!("读取 {} 失败：{error}", meta.display()))?;
+                let data =
+                    fs::read(&meta).with_context(|| format!("读取 {} 失败", meta.display()))?;
                 let entries = serde_json::from_slice(&data)
-                    .map_err(|error| format!("解析 {} 失败：{error}", meta.display()))?;
+                    .with_context(|| format!("解析 {} 失败", meta.display()))?;
                 (entries, false)
             }
-            Ok(_) => return Err(format!("{} 必须是普通文件。", meta.display())),
+            Ok(_) => bail!("{} 必须是普通文件。", meta.display()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), true),
-            Err(error) => return Err(format!("检查 {} 失败：{error}", meta.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("检查 {} 失败", meta.display()));
+            }
         };
         let history = Self {
             root,
@@ -74,11 +76,10 @@ impl History {
         let staging = tempfile::Builder::new()
             .prefix(".cargo-play-bundle-")
             .tempdir_in(&self.root)
-            .map_err(|error| format!("创建归档临时目录失败：{error}"))?;
+            .context("创建归档临时目录失败")?;
         let bundle = staging.path().join("archive.bundle");
         create_bundle(&bundle)?;
-        let mut bundle = TempPath::try_from_path(bundle)
-            .map_err(|error| format!("打开待发布的 Bundle 失败：{error}"))?;
+        let mut bundle = TempPath::try_from_path(bundle).context("打开待发布的 Bundle 失败")?;
         for stem in numbered(package) {
             if is_reserved(&stem) {
                 continue;
@@ -106,10 +107,10 @@ impl History {
                     if let Err(error) = self.write_index() {
                         return Err(match fs::remove_file(&path) {
                             Ok(()) => error,
-                            Err(cleanup) => format!(
-                                "{error}\n未登记的 Bundle 保留在 {}：{cleanup}",
+                            Err(cleanup) => error.context(format!(
+                                "清理未登记的 Bundle 失败（{cleanup}），文件保留在 {}",
                                 path.display()
-                            ),
+                            )),
                         });
                     }
                     return Ok(path);
@@ -118,11 +119,8 @@ impl History {
                     bundle = error.path;
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "保存 Bundle {} 失败：{}",
-                        path.display(),
-                        error.error
-                    ));
+                    return Err(error.error)
+                        .with_context(|| format!("保存 Bundle {} 失败", path.display()));
                 }
             }
         }
@@ -130,7 +128,7 @@ impl History {
     }
 
     fn write_index(&self) -> Result<()> {
-        let save = || -> io::Result<()> {
+        let save = || -> Result<()> {
             let mut file = NamedTempFile::new_in(self.meta.parent().expect("index is under home"))?;
             serde_json::to_writer_pretty(&mut file, &self.entries)?;
             file.write_all(b"\n")?;
@@ -138,7 +136,7 @@ impl History {
             file.persist(&self.meta).map_err(|error| error.error)?;
             Ok(())
         };
-        save().map_err(|error| format!("写入 {} 失败：{error}", self.meta.display()))
+        save().with_context(|| format!("写入 {} 失败", self.meta.display()))
     }
 }
 
@@ -174,7 +172,7 @@ pub fn check_package_name(name: &str) -> Result<()> {
             .chars()
             .any(|c| c.is_control() || ". /\\<>:\"|?*".contains(c))
     {
-        return Err(format!("Cargo.toml 中的包名 {name:?} 无法用作归档文件名。"));
+        bail!("Cargo.toml 中的包名 {name:?} 无法用作归档文件名。");
     }
     Ok(())
 }

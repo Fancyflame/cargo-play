@@ -5,6 +5,7 @@ mod repository;
 
 use std::{env, ffi::OsString, path::Path, process::ExitCode};
 
+use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use jiff::Zoned;
 use repository::Playground;
@@ -37,8 +38,6 @@ enum Action {
     Backup,
 }
 
-type Result<T> = std::result::Result<T, String>;
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = run(
@@ -50,7 +49,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("错误：{error}");
+            eprintln!("错误：{error:#}");
             ExitCode::FAILURE
         }
     }
@@ -75,12 +74,11 @@ fn run(
         }
         Action::Open => {
             let folder = config::resolve_home(home)?.join("play");
-            if !folder.is_dir() {
-                return Err(format!(
-                    "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cargo-play init。",
-                    folder.display()
-                ));
-            }
+            ensure!(
+                folder.is_dir(),
+                "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cargo-play init。",
+                folder.display()
+            );
             open_with_warning(&folder, open);
         }
         Action::Backup => playground(home, false)?.backup()?,
@@ -97,7 +95,7 @@ fn run(
 
 fn open_with_warning(folder: &Path, open: impl FnOnce(&Path) -> Result<()>) {
     if let Err(error) = open(folder) {
-        eprintln!("警告：{error}\n请手动打开 {}", folder.display());
+        eprintln!("警告：{error:#}\n请手动打开 {}", folder.display());
     }
 }
 
