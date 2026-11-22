@@ -10,7 +10,9 @@ use super::{
     filesystem::{
         close_tempdir, directory_exists, entry_names, is_reparse_point, temporary_dir, write_new,
     },
-    process::{checked, command, command_error, git, git_line, git_ok, line, run_command},
+    process::{
+        cargo_visible, checked, command, command_error, git, git_line, git_ok, line, run_command,
+    },
 };
 
 const TARGET_PATHSPEC: &str = ":(top,icase)target";
@@ -367,12 +369,23 @@ impl<'a> Worktree<'a> {
         sent.context("发送备份文件列表失败")
     }
 
-    pub(super) async fn init_project(&self, package: &str) -> Result<()> {
+    pub(super) async fn init_project(&self, package: &str, generate_lockfile: bool) -> Result<()> {
         // Generate in an isolated directory so Cargo cannot adopt leftovers or edit a parent workspace.
         let scaffold = temporary_dir(None, "cargo-play-scaffold-").await?;
         let result = self.populate_project(scaffold.path(), package).await;
         close_tempdir(scaffold).await;
-        result
+        result?;
+
+        let mut stage = vec!["add", "-f", "--", ".gitignore", "Cargo.toml", "src/main.rs"];
+        if generate_lockfile {
+            cargo_visible(self.root, &["generate-lockfile"]).await?;
+            stage.push("Cargo.lock");
+        }
+        git_ok(self.root, &stage).await?;
+        git_ok(self.root, &["commit", "-m", "init: cargo init"])
+            .await
+            .context("提交初始工程失败")?;
+        Ok(())
     }
 
     async fn populate_project(&self, scaffold: &Path, package: &str) -> Result<()> {
@@ -401,24 +414,13 @@ impl<'a> Worktree<'a> {
                 .await
                 .with_context(|| format!("写入 {name} 失败"))?;
         }
-        git_ok(
-            self.root,
-            &["add", "-f", "--", ".gitignore", "Cargo.toml", "src/main.rs"],
-        )
-        .await?;
-        git_ok(self.root, &["commit", "-m", "init: cargo init"])
-            .await
-            .context("提交初始工程失败")?;
         Ok(())
     }
 
     pub(super) async fn add_dependencies(&self, deps: &[String]) -> Result<()> {
-        let args = ["add", "--manifest-path", "Cargo.toml", "--"]
-            .into_iter()
-            .chain(deps.iter().map(String::as_str));
-        run_command(self.root, "cargo", args)
-            .await
-            .and_then(|output| checked("cargo add", output))?;
+        let mut args = vec!["add", "--manifest-path", "Cargo.toml", "--"];
+        args.extend(deps.iter().map(String::as_str));
+        cargo_visible(self.root, &args).await?;
         let lock_tracked = !git_ok(self.root, &["ls-files", "-z", "--", "Cargo.lock"])
             .await?
             .is_empty();

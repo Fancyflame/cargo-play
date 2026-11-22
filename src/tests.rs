@@ -672,6 +672,11 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     assert!(!fixture.play.join("cgpl_config.json5").exists());
     fixture.assert_no_archives();
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
+    assert!(fixture.play.join("Cargo.lock").is_file());
+    assert_eq!(
+        fixture.git(&["ls-tree", "--name-only", "HEAD", "--", "Cargo.lock"]),
+        "Cargo.lock"
+    );
     assert_eq!(
         fixture.git(&["branch", "--show-current"]),
         "sandbox-default"

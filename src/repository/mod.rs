@@ -120,7 +120,7 @@ impl Playground {
             write_new(&marker_path(&next), format!("{id}\n").as_bytes())
                 .await
                 .context("写入新工作区 UUID 失败")?;
-            fresh.init_project(&package).await?;
+            fresh.init_project(&package, deps.is_empty()).await?;
             if !deps.is_empty() {
                 fresh.add_dependencies(deps).await?;
             }

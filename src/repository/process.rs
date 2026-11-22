@@ -1,8 +1,13 @@
 //! 执行 Git 和 Cargo 子进程，配置运行环境并处理命令输出。
 
-use std::{env, ffi::OsStr, path::Path, process::Output};
+use std::{
+    env,
+    ffi::OsStr,
+    path::Path,
+    process::{Output, Stdio},
+};
 
-use anyhow::{Context, Error, Result, anyhow};
+use anyhow::{Context, Error, Result, anyhow, ensure};
 use tokio::process::Command;
 
 // Ignore Git's repository overrides inherited from hooks and other callers.
@@ -52,6 +57,17 @@ pub(super) async fn run_command(
         .output()
         .await
         .with_context(|| format!("无法执行 {program}"))
+}
+
+pub(super) async fn cargo_visible(root: &Path, args: &[&str]) -> Result<()> {
+    let subcommand = args[0];
+    let status = command(root, "cargo", args)
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("无法执行 cargo {subcommand}"))?;
+    ensure!(status.success(), "cargo {subcommand} 失败（{status}）");
+    Ok(())
 }
 
 pub(super) async fn git(
