@@ -2,13 +2,17 @@ use super::{
     Action, DbBackend, Fixture, State, Statement, Timestamp, Uuid, block_on, fs, new, not_opened,
 };
 use sea_orm::ConnectionTrait;
-use serde_json::{Value, json};
 use std::path::PathBuf;
 
-fn configure(fixture: &Fixture, limits: Value) {
+use crate::config::{AutoDeleteConfig, Config};
+
+fn configure(fixture: &Fixture, limits: AutoDeleteConfig) {
     fs::write(
-        fixture.home.join("cgpl_config.json"),
-        json!({ "auto_delete": limits }).to_string(),
+        fixture.home.join("cgpl_config.json5"),
+        json5::to_string(&Config {
+            auto_delete: Some(limits),
+        })
+        .unwrap(),
     )
     .unwrap();
 }
@@ -40,13 +44,13 @@ fn assert_deleted(fixture: &Fixture, id: Uuid, path: &std::path::Path) {
 
 #[test]
 fn new_keeps_archives_when_no_limits_are_configured() {
-    for limits in [
-        Value::Null,
-        json!({}),
-        json!({"after_count": null, "after_hours": null, "after_kbytes": null}),
+    for config in [
+        r#"{"auto_delete": null}"#,
+        r#"{"auto_delete": {}}"#,
+        r#"{"auto_delete": {"after_count": null, "after_hours": null, "after_kbytes": null}}"#,
     ] {
         let fixture = Fixture::previous_trial();
-        configure(&fixture, limits);
+        fs::write(fixture.home.join("cgpl_config.json5"), config).unwrap();
         let id = fixture.active().id;
         fixture.run(new(&[]), |_| Ok(())).unwrap();
         assert!(
@@ -66,7 +70,13 @@ fn zero_count_removes_the_just_archived_project_and_missing_archive_records() {
     let missing_path = seed_archive(&fixture, missing, "2000-01-01T00:00:00Z", None);
     let unregistered = fixture.home.join("history/unregistered.bundle");
     fs::write(&unregistered, "keep").unwrap();
-    configure(&fixture, json!({"after_count": 0}));
+    configure(
+        &fixture,
+        AutoDeleteConfig {
+            after_count: Some(0),
+            ..Default::default()
+        },
+    );
 
     fixture.run(new(&[]), |_| Ok(())).unwrap();
 
@@ -91,7 +101,13 @@ fn count_limit_removes_the_tail_in_reverse_list_order() {
     let tied = seed_archive(&fixture, last, time, Some(1));
     let earlier = Uuid::from_u128(3);
     let earlier_bundle = seed_archive(&fixture, earlier, "2000-01-01T00:00:00Z", Some(1));
-    configure(&fixture, json!({"after_count": 1}));
+    configure(
+        &fixture,
+        AutoDeleteConfig {
+            after_count: Some(1),
+            ..Default::default()
+        },
+    );
 
     fixture.run(new(&[]), |_| Ok(())).unwrap();
 
@@ -112,10 +128,21 @@ fn fractional_hours_expire_archives_by_last_visit() {
     let retained = Timestamp::from_second(now - 80 * 60).unwrap().to_string();
     let expired_bundle = seed_archive(&fixture, oldest, &expired, Some(1));
     let retained_bundle = seed_archive(&fixture, recent, &retained, Some(1));
-    configure(&fixture, json!({"after_hours": 1.5}));
+    fs::write(
+        fixture.home.join("cgpl_config.json"),
+        r#"{"auto_delete": {"after_count": 0}}"#,
+    )
+    .unwrap();
+    let config_path = fixture.home.join("cgpl_config.json5");
+    let config = concat!(
+        "\u{feff}// 自动删除配置\n",
+        "{ auto_delete: { /* 小时 */ 'after_hours': 1.5, after_count: 0x10, }, }\n",
+    );
+    fs::write(&config_path, config).unwrap();
 
     fixture.run(new(&[]), |_| Ok(())).unwrap();
 
+    assert_eq!(fs::read_to_string(config_path).unwrap(), config);
     assert_deleted(&fixture, oldest, &expired_bundle);
     assert!(retained_bundle.is_file());
     fixture.record(recent);
@@ -131,7 +158,11 @@ fn exceeding_only_the_size_limit_removes_oldest_until_the_exact_limit() {
     let kept = seed_archive(&fixture, recent, "2000-01-02T00:00:00Z", Some(1024));
     configure(
         &fixture,
-        json!({"after_count": 5, "after_hours": 1e10, "after_kbytes": 1}),
+        AutoDeleteConfig {
+            after_count: Some(5),
+            after_hours: Some(1e10),
+            after_kbytes: Some(1),
+        },
     );
 
     fixture.run(new(&[]), |_| Ok(())).unwrap();
@@ -145,11 +176,19 @@ fn exceeding_only_the_size_limit_removes_oldest_until_the_exact_limit() {
 fn invalid_hour_limit_is_rejected_before_clear() {
     let fixture = Fixture::previous_trial();
     let old = fixture.active();
-    configure(&fixture, json!({"after_hours": -0.5}));
+    for hours in [-0.5, f64::NAN, f64::INFINITY] {
+        configure(
+            &fixture,
+            AutoDeleteConfig {
+                after_hours: Some(hours),
+                ..Default::default()
+            },
+        );
 
-    let error = fixture.run(new(&[]), not_opened).unwrap_err();
+        let error = fixture.run(new(&[]), not_opened).unwrap_err();
 
-    assert!(format!("{error:#}").contains("auto_delete.after_hours"));
+        assert!(format!("{error:#}").contains("auto_delete.after_hours"));
+    }
     assert_eq!(fixture.active(), old);
     assert!(fixture.play.join("old.txt").is_file());
     fixture.assert_no_archives();
@@ -163,7 +202,13 @@ fn auto_delete_rejects_an_archive_path_that_is_not_a_file() {
     let path = seed_archive(&fixture, id, "2000-01-01T00:00:00Z", None);
     fs::create_dir(&path).unwrap();
     fs::write(path.join("keep"), "contents").unwrap();
-    configure(&fixture, json!({"after_count": 0}));
+    configure(
+        &fixture,
+        AutoDeleteConfig {
+            after_count: Some(0),
+            ..Default::default()
+        },
+    );
 
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
 
@@ -178,7 +223,13 @@ fn auto_delete_rejects_an_archive_path_that_is_not_a_file() {
 fn clear_does_not_trigger_auto_delete() {
     let fixture = Fixture::previous_trial();
     let id = fixture.active().id;
-    configure(&fixture, json!({"after_count": 0}));
+    configure(
+        &fixture,
+        AutoDeleteConfig {
+            after_count: Some(0),
+            ..Default::default()
+        },
+    );
 
     fixture
         .run(Action::Clear { force: false }, not_opened)
@@ -214,7 +265,11 @@ fn newly_archived_project_starts_at_zero_hours_but_still_counts_towards_size() {
         let stale_bundle = seed_archive(&fixture, stale_id, old_time, Some(1));
         configure(
             &fixture,
-            json!({"after_hours": 0, "after_kbytes": after_kbytes}),
+            AutoDeleteConfig {
+                after_hours: Some(0.0),
+                after_kbytes,
+                ..Default::default()
+            },
         );
         let before_new = Timestamp::now();
 

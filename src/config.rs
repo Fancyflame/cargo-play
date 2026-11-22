@@ -11,7 +11,8 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
-const CONFIG_FILE: &str = "cgpl_config.json";
+const CONFIG_FILE: &str = "cgpl_config.json5";
+const LEGACY_CONFIG_FILE: &str = "cgpl_config.json";
 
 pub fn resolve_home(home: Option<OsString>) -> Result<PathBuf> {
     let home = home
@@ -34,39 +35,42 @@ pub struct AutoDeleteConfig {
 
 impl Config {
     pub async fn load(home: &Path, create: bool) -> Result<Self> {
-        let config = Self::read(home).await?;
-        if let Some(hours) = config
-            .auto_delete
-            .as_ref()
-            .and_then(|limits| limits.after_hours)
-        {
-            ensure!(
-                hours.is_finite() && hours >= 0.0,
-                "{CONFIG_FILE} 中的 auto_delete.after_hours 必须是非负有限值"
-            );
+        for filename in [CONFIG_FILE, LEGACY_CONFIG_FILE] {
+            let path = home.join(filename);
+            let Some(config) = Self::read(&path).await? else {
+                continue;
+            };
+            if let Some(hours) = config
+                .auto_delete
+                .as_ref()
+                .and_then(|limits| limits.after_hours)
+            {
+                ensure!(
+                    hours.is_finite() && hours >= 0.0,
+                    "{} 中的 auto_delete.after_hours 必须是非负有限值",
+                    path.display()
+                );
+            }
+            return Ok(config);
         }
+        let config = Self::default();
         if create {
             config.write_if_missing(home).await?;
         }
         Ok(config)
     }
 
-    async fn read(home: &Path) -> Result<Self> {
-        let path = home.join(CONFIG_FILE);
-        let data = match fs::read(&path).await {
+    async fn read(path: &Path) -> Result<Option<Self>> {
+        let data = match fs::read_to_string(path).await {
             Ok(data) => data,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error).with_context(|| format!("读取 {} 失败", path.display()));
             }
         };
-        let data = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&data);
-        // A derived struct can also be read as a sequence by Serde.
-        ensure!(
-            data.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{'),
-            "{CONFIG_FILE} 必须是 JSON 对象"
-        );
-        serde_json::from_slice(data).with_context(|| format!("{CONFIG_FILE} 必须是 JSON 对象"))
+        json5::from_str(&data)
+            .map(Some)
+            .with_context(|| format!("解析 JSON5 配置 {} 失败", path.display()))
     }
 
     async fn write_if_missing(&self, home: &Path) -> Result<()> {
@@ -83,9 +87,9 @@ impl Config {
                 return Err(error).with_context(|| format!("创建 {} 失败", path.display()));
             }
         };
-        let mut data = serde_json::to_vec_pretty(self)?;
-        data.push(b'\n');
-        file.write_all(&data)
+        let mut data = json5::to_string(self)?;
+        data.push('\n');
+        file.write_all(data.as_bytes())
             .await
             .with_context(|| format!("写入 {} 失败", path.display()))?;
         file.flush()

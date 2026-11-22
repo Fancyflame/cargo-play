@@ -16,7 +16,9 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::{
-    Action, Cli, Playground, PlaygroundTarget, default_package_name, list_playgrounds, run,
+    Action, Cli, Playground, PlaygroundTarget,
+    config::Config,
+    default_package_name, list_playgrounds, run,
     state::{NameMatch, PlaygroundRecord, State},
 };
 
@@ -506,6 +508,7 @@ fn opens_existing_folder_directly() {
         .unwrap();
     assert!(opened);
     assert!(fs::read_dir(&fixture.play).unwrap().next().is_none());
+    assert!(!fixture.home.join("cgpl_config.json5").exists());
     assert!(!fixture.home.join("cgpl_config.json").exists());
 }
 
@@ -515,6 +518,20 @@ fn open_requires_an_existing_folder() {
     let error = fixture.run(Action::Open, not_opened).unwrap_err();
     assert!(error.to_string().contains("找不到试验文件夹"));
     assert!(!fixture.play.exists());
+}
+
+#[test]
+fn loads_legacy_config_without_creating_json5() {
+    let fixture = Fixture::empty();
+    let path = fixture.home.join("cgpl_config.json");
+    let original = r#"{"auto_delete": {"after_count": 3}}"#;
+    fs::write(&path, original).unwrap();
+
+    let config = block_on(Config::load(&fixture.home, true)).unwrap();
+
+    assert_eq!(config.auto_delete.unwrap().after_count, Some(3));
+    assert!(!fixture.home.join("cgpl_config.json5").exists());
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 
 #[test]
@@ -529,6 +546,8 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     );
     fixture.run(Action::Init, not_opened).unwrap();
     fixture.run(Action::Init, not_opened).unwrap();
+    assert!(fixture.home.join("cgpl_config.json5").is_file());
+    assert!(!fixture.home.join("cgpl_config.json").exists());
     assert!(fixture.home.join("history").is_dir());
     fixture.assert_no_archives();
     assert!(!fixture.play.join("Cargo.toml").exists());
@@ -550,7 +569,7 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     assert!(!fixture.home.join(".git").exists());
     assert!(fixture.home.join("target/cache").exists());
     assert!(!fixture.play.join("target").exists());
-    assert!(!fixture.play.join("cgpl_config.json").exists());
+    assert!(!fixture.play.join("cgpl_config.json5").exists());
     fixture.assert_no_archives();
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
 }
