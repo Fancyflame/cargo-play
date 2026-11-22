@@ -1,11 +1,11 @@
-﻿mod config;
+mod config;
 mod editor;
 mod repository;
 
 use std::{env, path::Path, process::ExitCode};
 
-use chrono::Utc;
 use clap::{Parser, Subcommand};
+use jiff::{Timestamp, Zoned};
 use repository::Repository;
 
 #[derive(Parser)]
@@ -48,9 +48,13 @@ fn main() -> ExitCode {
     }
 }
 
+fn default_branch_name(now: &Zoned) -> String {
+    now.strftime("play/new-%Y%m%d-%H%M%S").to_string()
+}
+
 fn run(action: Action, repo: Repository, open: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-    let now = Utc::now();
-    let timestamp = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = Timestamp::now();
+    let timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
     match action {
         Action::Init => println!("试验仓库已就绪：{}", repo.root.display()),
         Action::Backup => {
@@ -61,7 +65,7 @@ fn run(action: Action, repo: Repository, open: impl FnOnce(&Path) -> Result<()>)
             if repo.has_changes()? {
                 return Err("备份后工作区仍有改动，请运行 git status 检查后重试。".into());
             }
-            let branch = repo.new_branch(&now.format("play/%Y%m%d-%H%M%SZ").to_string())?;
+            let branch = repo.new_branch(&default_branch_name(&Zoned::now()))?;
             let recover = |error| {
                 format!(
                     "{error}\n当前仍在 {branch}。请在 {} 中运行 git status 检查现场，修复后可运行 cargo-play backup 保存改动。",

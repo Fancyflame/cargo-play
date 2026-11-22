@@ -6,9 +6,10 @@ use std::{
 };
 
 use clap::Parser;
+use jiff::{Timestamp, tz};
 use tempfile::TempDir;
 
-use crate::{Action, Cli, Repository, config::Config, run};
+use crate::{Action, Cli, Repository, config::Config, default_branch_name, run};
 
 const MAIN: &str = "fn main() {}\n";
 const MANIFEST: &str = "[package]\nname = \"old-trial\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
@@ -199,6 +200,13 @@ fn first_use_creates_nested_repository_and_config_and_preserves_targets() {
 }
 
 #[test]
+fn branch_name_uses_local_time() {
+    let instant: Timestamp = "2026-01-01T20:00:00Z".parse().unwrap();
+    let local = instant.to_zoned(tz::offset(8).to_time_zone());
+    assert_eq!(default_branch_name(&local), "play/new-20260102-040000");
+}
+
+#[test]
 fn backs_up_old_project_then_initializes_fresh_trial() {
     let fixture = Fixture::previous_trial();
     let legacy_config = r#"{"template_branch":"missing"}"#;
@@ -223,13 +231,15 @@ fn backs_up_old_project_then_initializes_fresh_trial() {
     assert!(
         fixture
             .git(&["branch", "--show-current"])
-            .starts_with("play/")
+            .starts_with("play/new-")
     );
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
-    assert!(
-        fixture
-            .git(&["log", "-1", "--format=%s", "previous"])
-            .starts_with("backup: ")
+    let message = fixture.git(&["log", "-1", "--format=%s", "previous"]);
+    let timestamp = message.strip_prefix("backup: ").unwrap();
+    assert_eq!(timestamp.len(), "2026-01-01T00:00:00Z".len());
+    assert_eq!(
+        timestamp.parse::<Timestamp>().unwrap().to_string(),
+        timestamp
     );
     let files = fixture.git(&[
         "diff-tree",
