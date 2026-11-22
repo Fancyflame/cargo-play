@@ -100,7 +100,7 @@ pub(super) struct Worktree<'a> {
 
 impl<'a> Worktree<'a> {
     pub(super) async fn init(root: &'a Path) -> Result<Self> {
-        git_ok(root, &["init", "--initial-branch=archive"]).await?;
+        git_ok(root, &["init"]).await?;
         Self::open(root).await
     }
 
@@ -376,17 +376,7 @@ impl<'a> Worktree<'a> {
     }
 
     async fn populate_project(&self, scaffold: &Path, package: &str) -> Result<()> {
-        let args = [
-            "init",
-            "--vcs",
-            "none",
-            "--bin",
-            "--name",
-            package,
-            "--edition",
-            "2024",
-            ".",
-        ];
+        let args = ["init", "--vcs", "none", "--bin", "--name", package, "."];
         run_command(scaffold, "cargo", args)
             .await
             .and_then(|output| checked("cargo init", output))?;

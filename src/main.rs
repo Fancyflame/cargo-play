@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// 初始化 CARGOPLAY_HOME 下的配置、数据库、play 和 history
+    /// 初始化 CGPL_HOME 下的配置、数据库、play 和 history
     Init,
     /// 归档上一个试验，用 cargo init 创建新试验并打开项目文件夹
     ///
@@ -105,12 +105,7 @@ impl FromStr for PlaygroundTarget {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = run(
-        cli.command,
-        env::var_os("CARGOPLAY_HOME"),
-        editor::open_folder,
-    )
-    .await;
+    let result = run(cli.command, env::var_os("CGPL_HOME"), editor::open_folder).await;
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -259,7 +254,7 @@ async fn open_play_folder(
 ) -> Result<()> {
     ensure!(
         directory_exists(folder).await?,
-        "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cgpl init。",
+        "找不到试验文件夹 {}，请检查 CGPL_HOME 或运行 cgpl init。",
         folder.display()
     );
     open_with_warning(folder, open).await;

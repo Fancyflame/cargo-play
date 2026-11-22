@@ -17,8 +17,8 @@ const LEGACY_CONFIG_FILE: &str = "cgpl_config.json";
 pub fn resolve_home(home: Option<OsString>) -> Result<PathBuf> {
     let home = home
         .filter(|value| !value.is_empty())
-        .context("请设置 CARGOPLAY_HOME，使其指向包含 play 子目录的根目录。")?;
-    path::absolute(home).context("解析 CARGOPLAY_HOME 失败")
+        .context("请设置 CGPL_HOME，使其指向包含 play 子目录的根目录。")?;
+    path::absolute(home).context("解析 CGPL_HOME 失败")
 }
 
 #[derive(Default, Deserialize, Serialize)]

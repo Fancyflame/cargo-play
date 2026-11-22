@@ -248,12 +248,13 @@ fn active_with_bundle() -> (Fixture, PlaygroundRecord, std::path::PathBuf) {
     let id = fixture.active().id;
     let path = format!("history/{id}.bundle");
     let bundle = fixture.home.join(&path);
+    let branch = fixture.git(&["symbolic-ref", "HEAD"]);
     fixture.git(&[
         "bundle",
         "create",
         bundle.to_str().unwrap(),
         "HEAD",
-        "refs/heads/archive",
+        &branch,
     ]);
     update_bundle_path(&fixture, id, &path);
     let record = fixture.active();

@@ -47,7 +47,7 @@ impl Fixture {
         fs::create_dir_all(&home).unwrap();
         fs::write(
             home.join("test-gitconfig"),
-            "[user]\nname = Cargo Play Test\nemail = test@example.com\n[commit]\ngpgsign = false\n",
+            "[user]\nname = Cargo Play Test\nemail = test@example.com\n[commit]\ngpgsign = false\n[init]\ndefaultBranch = sandbox-default\n",
         )
         .unwrap();
         Self {
@@ -545,6 +545,10 @@ fn init_and_first_new_create_history_and_clear_only_play() {
             .contains("首次使用")
     );
     fixture.run(Action::Init, not_opened).unwrap();
+    assert_eq!(
+        fixture.git(&["symbolic-ref", "--short", "HEAD"]),
+        "sandbox-default"
+    );
     fixture.run(Action::Init, not_opened).unwrap();
     assert!(fixture.home.join("cgpl_config.json5").is_file());
     assert!(!fixture.home.join("cgpl_config.json").exists());
@@ -572,6 +576,31 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     assert!(!fixture.play.join("cgpl_config.json5").exists());
     fixture.assert_no_archives();
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
+    assert_eq!(
+        fixture.git(&["branch", "--show-current"]),
+        "sandbox-default"
+    );
+
+    let reference = tempfile::tempdir().unwrap();
+    let output = Command::new("cargo")
+        .current_dir(reference.path())
+        .args(["init", "--vcs", "none", "--bin", "--name", "reference", "."])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let [generated, expected] = [fixture.play.as_path(), reference.path()].map(|project| {
+        fs::read_to_string(project.join("Cargo.toml"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("edition = "))
+            .unwrap()
+            .to_owned()
+    });
+    assert_eq!(generated, expected);
 }
 
 #[cfg(windows)]
@@ -709,7 +738,7 @@ fn first_new_requires_force_to_discard_legacy_projects() {
     assert!(!fixture.play.join("old.txt").exists());
     assert_eq!(
         fixture.git(&["for-each-ref", "--format=%(refname)", "refs/heads"]),
-        "refs/heads/archive"
+        "refs/heads/sandbox-default"
     );
 }
 
@@ -901,12 +930,13 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
     let id = fixture.active().id;
     let bundle = fixture.home.join(format!("history/{id}.bundle"));
     // Simulate an active playground that already has an archive after resuming.
+    let branch = fixture.git(&["symbolic-ref", "HEAD"]);
     fixture.git(&[
         "bundle",
         "create",
         bundle.to_str().unwrap(),
         "HEAD",
-        "refs/heads/archive",
+        &branch,
     ]);
     let bytes = fs::read(&bundle).unwrap();
     block_on(async {
@@ -991,7 +1021,8 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
 #[test]
 fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     let fixture = Fixture::previous_trial();
-    fixture.git(&["branch", "-m", "experiment"]);
+    // Older versions used archive as the initial branch.
+    fixture.git(&["branch", "-m", "archive"]);
     let original = fixture.active();
     let original_head = fixture.git(&["rev-parse", "HEAD"]);
     fixture.run(new(&[]), |_| Ok(())).unwrap();
@@ -1044,7 +1075,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
         .parse::<Timestamp>()
         .unwrap();
     assert!((before_resume..=last_visit).contains(&other_visit));
-    assert_eq!(fixture.git(&["branch", "--show-current"]), "experiment");
+    assert_eq!(fixture.git(&["branch", "--show-current"]), "archive");
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), original_head);
     assert_eq!(fs::read(&original_bundle).unwrap(), bundle_contents);
     assert_eq!(
@@ -1081,6 +1112,10 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
         .unwrap();
     assert_eq!(fixture.active().id, other.id);
     assert_eq!(fixture.active().name, other.name);
+    assert_eq!(
+        fixture.git(&["branch", "--show-current"]),
+        "sandbox-default"
+    );
     assert_eq!(
         fs::read_to_string(fixture.play.join("draft.txt")).unwrap(),
         "other project changes"
@@ -1432,13 +1467,14 @@ fn failed_snapshot_apply_leaves_play_empty_and_the_previous_project_recoverable(
     let backup = fixture.home.join("invalid-snapshot.bundle");
     let snapshot_ref = "refs/cargo-play/worktree";
     // Advertise an ordinary commit as the snapshot so cloning works but stash apply fails.
+    let branch = fixture.git(&["symbolic-ref", "HEAD"]);
     fixture.git(&["update-ref", snapshot_ref, "HEAD"]);
     fixture.git(&[
         "bundle",
         "create",
         backup.to_str().unwrap(),
         "HEAD",
-        "refs/heads/archive",
+        &branch,
         snapshot_ref,
     ]);
     fixture.git(&["update-ref", "-d", snapshot_ref]);
