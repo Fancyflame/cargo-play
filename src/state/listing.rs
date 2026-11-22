@@ -2,12 +2,13 @@ use std::{num::NonZeroU64, path::Path};
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use super::{
-    State,
+    PlaygroundRecord, State,
     database::{connect, existing_path},
+    entities::playground,
 };
 
 const LIST_PAGE_SIZE: i64 = 50;
@@ -57,6 +58,21 @@ impl State {
                 })
             })
             .collect()
+    }
+
+    pub async fn oldest_archives(&self) -> Result<Vec<PlaygroundRecord>> {
+        // The reverse of the list order, served by the same visit index.
+        playground::Entity::find()
+            .from_raw_sql(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, name, archived_path, last_visit_time FROM playgrounds
+                 WHERE archived_path IS NOT NULL
+                   AND id NOT IN (SELECT playground_id FROM current_playground)
+                 ORDER BY rtrim(last_visit_time, 'Z') ASC, id DESC",
+            ))
+            .all(&self.0)
+            .await
+            .context("读取待清理的归档列表失败")
     }
 
     // The caller holds the workspace lock while resolving a position to a UUID.

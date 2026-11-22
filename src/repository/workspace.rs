@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use jiff::Timestamp;
 use tempfile::TempDir;
 use tokio::fs;
 use uuid::Uuid;
@@ -44,16 +45,14 @@ impl Playground {
         existing: bool,
         current: Option<&PlaygroundRecord>,
         new: Option<(Uuid, &str)>,
-    ) -> Result<()> {
+    ) -> Result<Timestamp> {
         let next = staging.path().join("next");
         let mut changes = WorkspaceChanges::default();
         let result = async {
             let archive = if let Some(record) = current {
                 let old = Worktree::open(&self.root).await?;
-                let verify_in = if new.is_some() { &next } else { &self.root };
                 old.bundle(
                     &staging.path().join("next.bundle"),
-                    verify_in,
                     &staging.path().join("archive.index"),
                 )
                 .await?;
@@ -65,9 +64,10 @@ impl Playground {
                 None
             };
 
+            let archived_at = Timestamp::now();
             let txn = match new {
-                Some((id, name)) => state.stage_switch(id, name, archive.as_ref()).await?,
-                None => state.stage_clear(archive.as_ref()).await?,
+                Some((id, name)) => state.stage_new(id, name).await?,
+                None => state.stage_clear(archive.as_ref(), archived_at).await?,
             };
             changes
                 .switch_worktree(&self.root, staging.path(), &next, existing, rename_entry)
@@ -86,7 +86,7 @@ impl Playground {
                     self.home.join(archive.path).display()
                 );
             }
-            Ok(())
+            Ok(archived_at)
         }
         .await;
         changes.finish(staging, result).await
@@ -173,7 +173,7 @@ impl WorkspaceChanges {
         Ok(())
     }
 
-    pub(super) async fn finish(self, staging: TempDir, result: Result<()>) -> Result<()> {
+    pub(super) async fn finish<T>(self, staging: TempDir, result: Result<T>) -> Result<T> {
         if let Err(error) = result {
             let mut restore_errors = Vec::new();
             if let Some((path, previous)) = self.archive {
@@ -202,7 +202,7 @@ impl WorkspaceChanges {
             return Err(error);
         }
         close_tempdir(staging).await;
-        Ok(())
+        result
     }
 }
 

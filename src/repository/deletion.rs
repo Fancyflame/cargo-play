@@ -6,10 +6,14 @@ use super::{
     workspace::WorkspaceChanges,
 };
 use anyhow::{Context, Result, bail, ensure};
+use jiff::Timestamp;
 use std::{io, path::PathBuf};
 use tokio::fs;
 
-use crate::state::{PlaygroundRecord, State};
+use crate::{
+    config::AutoDeleteConfig,
+    state::{PlaygroundRecord, State},
+};
 
 impl Playground {
     pub async fn delete(
@@ -36,15 +40,72 @@ impl Playground {
             return Ok(());
         }
 
+        self.delete_record(&state, &record, is_current).await
+    }
+
+    pub(super) async fn prune_archives(
+        &self,
+        state: &State,
+        limits: &AutoDeleteConfig,
+        archived_at: Timestamp,
+    ) -> Result<()> {
+        let max_bytes = limits.after_kbytes.map(|units| u128::from(units) * 1024);
+        if limits.after_count.is_none() && limits.after_hours.is_none() && max_bytes.is_none() {
+            return Ok(());
+        }
+
+        let archives = state.oldest_archives().await?;
+        let mut sizes = vec![0; archives.len()];
+        let mut total_bytes = 0;
+        if max_bytes.is_some() {
+            for (record, size) in archives.iter().zip(&mut sizes) {
+                if let Some((_, bytes)) = self.bundle_metadata(record).await? {
+                    *size = u128::from(bytes);
+                    total_bytes += *size;
+                }
+            }
+        }
+
+        let mut remaining = archives.len();
+        for (record, size) in archives.iter().zip(sizes) {
+            let over_count = limits
+                .after_count
+                .is_some_and(|max| remaining > max as usize);
+            let over_size = max_bytes.is_some_and(|max| total_bytes > max);
+            let expired = if let Some(max_hours) = limits.after_hours {
+                let last_visit = record
+                    .last_visit_time
+                    .parse::<Timestamp>()
+                    .with_context(|| format!("游乐场 {} 的上次访问时间无效", record.id))?;
+                archived_at.duration_since(last_visit).as_secs_f64() / 3600.0 > max_hours
+            } else {
+                false
+            };
+            if !over_count && !over_size && !expired {
+                break;
+            }
+            self.delete_record(state, record, false).await?;
+            remaining -= 1;
+            total_bytes -= size;
+        }
+        Ok(())
+    }
+
+    async fn delete_record(
+        &self,
+        state: &State,
+        record: &PlaygroundRecord,
+        is_current: bool,
+    ) -> Result<()> {
         if is_current {
             self.verify_current(record.id).await?;
         }
-        let bundle = self.bundle_to_delete(&record).await?;
+        let bundle = self.bundle_metadata(record).await?;
         let staging = temporary_dir(Some(&self.home), ".cargo-play-delete-").await?;
         let mut changes = WorkspaceChanges::default();
         let result = async {
             let txn = state.stage_delete(record.id).await?;
-            if let Some(bundle) = bundle {
+            if let Some((bundle, _)) = bundle {
                 changes
                     .move_entry(
                         &bundle,
@@ -68,7 +129,7 @@ impl Playground {
         Ok(())
     }
 
-    async fn bundle_to_delete(&self, record: &PlaygroundRecord) -> Result<Option<PathBuf>> {
+    async fn bundle_metadata(&self, record: &PlaygroundRecord) -> Result<Option<(PathBuf, u64)>> {
         let Some(stored) = &record.archived_path else {
             return Ok(None);
         };
@@ -83,7 +144,7 @@ impl Playground {
         }
         let path = self.home.join(expected);
         match fs::symlink_metadata(&path).await {
-            Ok(info) if info.is_file() && !is_reparse_point(&info) => Ok(Some(path)),
+            Ok(info) if info.is_file() && !is_reparse_point(&info) => Ok(Some((path, info.len()))),
             Ok(_) => bail!("归档路径 {} 必须是普通文件。", path.display()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => {

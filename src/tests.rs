@@ -1,3 +1,4 @@
+mod auto_delete;
 mod deletion;
 
 use std::{
@@ -78,7 +79,7 @@ impl Fixture {
             let state = State::open(&fixture.home).await.unwrap();
             let id = Uuid::new_v4();
             state
-                .stage_switch(id, "old-trial", None)
+                .stage_new(id, "old-trial")
                 .await
                 .unwrap()
                 .commit()
@@ -505,7 +506,7 @@ fn opens_existing_folder_directly() {
         .unwrap();
     assert!(opened);
     assert!(fs::read_dir(&fixture.play).unwrap().next().is_none());
-    assert!(!fixture.home.join("cargo-play.json").exists());
+    assert!(!fixture.home.join("cgpl_config.json").exists());
 }
 
 #[test]
@@ -549,7 +550,7 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     assert!(!fixture.home.join(".git").exists());
     assert!(fixture.home.join("target/cache").exists());
     assert!(!fixture.play.join("target").exists());
-    assert!(!fixture.play.join("cargo-play.json").exists());
+    assert!(!fixture.play.join("cgpl_config.json").exists());
     fixture.assert_no_archives();
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
 }
@@ -622,6 +623,7 @@ fn nonempty_play_without_manifest_requires_force_even_without_git() {
 #[test]
 fn invalid_manifest_is_archived_using_the_stored_name() {
     let fixture = Fixture::previous_trial();
+    let id = fixture.active().id;
     fixture.vendor();
     fs::write(fixture.play.join("Cargo.toml"), "invalid toml").unwrap();
     let force = |deps: &[&str]| Action::New {
@@ -634,6 +636,17 @@ fn invalid_manifest_is_archived_using_the_stored_name() {
         .run(force(&["play-fixture-missing@1"]), not_opened)
         .unwrap_err();
     assert!(error.to_string().contains("cargo add 失败"), "{error}");
+    assert!(fs::read_dir(&fixture.play).unwrap().next().is_none());
+    assert!(fixture.archive_at("old-trial").is_file());
+    fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(id),
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
     assert!(fixture.play.join("old.txt").is_file());
     assert_eq!(
         fs::read_to_string(fixture.play.join("Cargo.toml")).unwrap(),
@@ -684,7 +697,7 @@ fn first_new_requires_force_to_discard_legacy_projects() {
 #[test]
 fn package_name_uses_local_time() {
     let instant: Timestamp = "2026-01-01T20:00:00Z".parse().unwrap();
-    let local = instant.to_zoned(tz::offset(8).to_time_zone());
+    let local = instant.to_zoned_datetime(tz::offset(8).to_time_zone());
     assert_eq!(default_package_name(&local), "play-new-20260102-040000");
 }
 
@@ -894,7 +907,7 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
             .unwrap();
         for statement in [
             "CREATE TABLE commit_failure (id INTEGER REFERENCES current_playground(slot) DEFERRABLE INITIALLY DEFERRED)",
-            "CREATE TRIGGER reject_commit AFTER INSERT ON playgrounds BEGIN INSERT INTO commit_failure VALUES (2); END",
+            "CREATE TRIGGER reject_commit AFTER UPDATE OF archived_path ON playgrounds BEGIN INSERT INTO commit_failure VALUES (2); END",
         ] {
             state
                 .connection()
@@ -930,7 +943,10 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
     fixture.run(new(&[]), |_| Ok(())).unwrap();
     let updated = fixture.record(id);
     assert_eq!(updated.archived_path, record.archived_path);
-    assert_eq!(updated.last_visit_time, record.last_visit_time);
+    assert!(
+        updated.last_visit_time.parse::<Timestamp>().unwrap()
+            > record.last_visit_time.parse::<Timestamp>().unwrap()
+    );
     assert_ne!(fs::read(&bundle).unwrap(), bytes);
     assert_eq!(
         fs::read_dir(fixture.home.join("history")).unwrap().count(),
@@ -962,7 +978,13 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     fixture.run(new(&[]), |_| Ok(())).unwrap();
     let other = fixture.active();
     let original_archive = fixture.record(original.id);
-    assert_eq!(original_archive.last_visit_time, original.last_visit_time);
+    assert!(
+        original_archive
+            .last_visit_time
+            .parse::<Timestamp>()
+            .unwrap()
+            >= original.last_visit_time.parse::<Timestamp>().unwrap()
+    );
     let original_bundle = fixture
         .home
         .join(original_archive.archived_path.as_ref().unwrap());
@@ -997,10 +1019,12 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     assert_eq!(resumed.archived_path, original_archive.archived_path);
     let last_visit = resumed.last_visit_time.parse::<Timestamp>().unwrap();
     assert!((before_resume..=Timestamp::now()).contains(&last_visit));
-    assert_eq!(
-        fixture.record(other.id).last_visit_time,
-        other.last_visit_time
-    );
+    let other_visit = fixture
+        .record(other.id)
+        .last_visit_time
+        .parse::<Timestamp>()
+        .unwrap();
+    assert!((before_resume..=last_visit).contains(&other_visit));
     assert_eq!(fixture.git(&["branch", "--show-current"]), "experiment");
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), original_head);
     assert_eq!(fs::read(&original_bundle).unwrap(), bundle_contents);
@@ -1016,7 +1040,7 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
             original.name.as_str(),
             &original.id.to_string(),
             last_visit
-                .to_zoned(tz::TimeZone::UTC)
+                .to_zoned_datetime(tz::TimeZone::UTC)
                 .strftime("%Y-%m-%d %H:%M:%S %:z")
                 .to_string()
                 .as_str(),
@@ -1282,7 +1306,7 @@ fn resume_requires_force_to_discard_an_unregistered_workspace() {
         State::open(&fixture.home)
             .await
             .unwrap()
-            .stage_clear(None)
+            .stage_clear(None, Timestamp::now())
             .await
             .unwrap()
             .commit()
@@ -1609,17 +1633,30 @@ fn bundle_failure_preserves_the_current_project() {
 }
 
 #[test]
-fn cargo_failure_preserves_original_project_before_backup() {
+fn cargo_failure_leaves_old_project_archived_and_play_empty() {
     let fixture = Fixture::previous_trial();
+    let id = fixture.active().id;
     fixture.vendor();
     fs::write(fixture.play.join("draft.txt"), "keep").unwrap();
     let error = fixture
         .run(new(&["play-fixture-missing@1"]), not_opened)
         .unwrap_err();
     assert!(error.to_string().contains("cargo add 失败"), "{error}");
-    assert_eq!(fixture.git(&["log", "--format=%s"]), "old trial");
-    assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
-    fixture.assert_no_archives();
+    assert!(fs::read_dir(&fixture.play).unwrap().next().is_none());
+    assert!(fixture.archive_at("old-trial").is_file());
+    fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(id),
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("draft.txt")).unwrap(),
+        "keep"
+    );
 }
 
 #[test]

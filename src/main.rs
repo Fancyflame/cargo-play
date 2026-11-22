@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
-use jiff::{Zoned, tz::TimeZone};
+use jiff::{ZonedDateTime, tz::TimeZone};
 use repository::{Playground, PlaygroundTarget, directory_exists};
 use state::PlaygroundRecord;
 use uuid::Uuid;
@@ -33,7 +33,7 @@ enum Action {
     Init,
     /// 归档上一个试验，用 cargo init 创建新试验并打开项目文件夹
     ///
-    /// Git 忽略的文件随旧工作区清理。
+    /// 清场后按 auto_delete 配置清理旧归档。Git 忽略的文件随旧工作区清理。
     New {
         /// 依赖列表，支持 crate 名和 crate@版本
         #[arg(short = 'd', long, value_name = "依赖", num_args = 1..)]
@@ -65,7 +65,7 @@ enum Action {
     },
     /// 归档当前试验并清空 play 文件夹
     ///
-    /// Git 忽略的文件随旧工作区清理。
+    /// 清场后按 auto_delete 配置清理旧归档。Git 忽略的文件随旧工作区清理。
     Clear {
         /// 允许丢弃未登记的工作区内容
         #[arg(short, long)]
@@ -120,7 +120,7 @@ async fn main() -> ExitCode {
     }
 }
 
-fn default_package_name(now: &Zoned) -> String {
+fn default_package_name(now: &ZonedDateTime) -> String {
     now.strftime("play-new-%Y%m%d-%H%M%S").to_string()
 }
 
@@ -169,7 +169,7 @@ async fn run(
             let playground = Playground::open(home, true).await?;
             playground
                 .new_project(
-                    &default_package_name(&Zoned::now()),
+                    &default_package_name(&ZonedDateTime::now()),
                     name.as_deref(),
                     &deps,
                     force,
@@ -234,7 +234,7 @@ async fn list_playgrounds(home: &Path, time_zone: &TimeZone, offset: u64) -> Res
         }
         let date = entry
             .last_visit_time
-            .to_zoned(time_zone.clone())
+            .to_zoned_datetime(time_zone.clone())
             .strftime("%Y-%m-%d %H:%M:%S %:z")
             .to_string();
         let position = offset + index as u64 + 1;

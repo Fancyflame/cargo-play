@@ -166,7 +166,7 @@ impl<'a> Worktree<'a> {
         Ok(Self { root })
     }
 
-    pub(super) async fn bundle(&self, path: &Path, verify_in: &Path, index: &Path) -> Result<()> {
+    pub(super) async fn bundle(&self, path: &Path, index: &Path) -> Result<()> {
         if git_line(self.root, &["rev-parse", "--is-shallow-repository"]).await? == "true" {
             bail!("浅克隆仓库无法归档为完整 Bundle，请先补全 Git 历史。");
         }
@@ -218,7 +218,7 @@ impl<'a> Worktree<'a> {
             }
         }
         created?;
-        checked("git bundle verify", git(verify_in, bundle("verify")).await?)?;
+        checked("git bundle verify", git(self.root, bundle("verify")).await?)?;
         async {
             fs::OpenOptions::new()
                 .write(true)

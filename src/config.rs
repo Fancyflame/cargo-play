@@ -11,7 +11,7 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
-const CONFIG_FILE: &str = "cargo-play.json";
+const CONFIG_FILE: &str = "cgpl_config.json";
 
 pub fn resolve_home(home: Option<OsString>) -> Result<PathBuf> {
     let home = home
@@ -20,14 +20,37 @@ pub fn resolve_home(home: Option<OsString>) -> Result<PathBuf> {
     path::absolute(home).context("解析 CARGOPLAY_HOME 失败")
 }
 
-pub async fn prepare_config(home: &Path, create: bool) -> Result<()> {
-    Config::read(home).await?.prepare(home, create).await
+#[derive(Default, Deserialize, Serialize)]
+pub struct Config {
+    pub auto_delete: Option<AutoDeleteConfig>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
-pub struct Config {}
+pub struct AutoDeleteConfig {
+    pub after_count: Option<u32>,
+    pub after_hours: Option<f64>,
+    pub after_kbytes: Option<u64>,
+}
 
 impl Config {
+    pub async fn load(home: &Path, create: bool) -> Result<Self> {
+        let config = Self::read(home).await?;
+        if let Some(hours) = config
+            .auto_delete
+            .as_ref()
+            .and_then(|limits| limits.after_hours)
+        {
+            ensure!(
+                hours.is_finite() && hours >= 0.0,
+                "{CONFIG_FILE} 中的 auto_delete.after_hours 必须是非负有限值"
+            );
+        }
+        if create {
+            config.write_if_missing(home).await?;
+        }
+        Ok(config)
+    }
+
     async fn read(home: &Path) -> Result<Self> {
         let path = home.join(CONFIG_FILE);
         let data = match fs::read(&path).await {
@@ -46,10 +69,7 @@ impl Config {
         serde_json::from_slice(data).with_context(|| format!("{CONFIG_FILE} 必须是 JSON 对象"))
     }
 
-    async fn prepare(&self, home: &Path, create: bool) -> Result<()> {
-        if !create {
-            return Ok(());
-        }
+    async fn write_if_missing(&self, home: &Path) -> Result<()> {
         let path = home.join(CONFIG_FILE);
         let mut file = match OpenOptions::new()
             .write(true)

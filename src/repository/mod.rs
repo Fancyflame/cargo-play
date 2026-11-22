@@ -14,11 +14,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use jiff::Timestamp;
 use tokio::{fs, task::spawn_blocking};
 use uuid::Uuid;
 
 use crate::{
-    config::{prepare_config, resolve_home},
+    config::{Config, resolve_home},
     state::{PlaygroundRecord, State},
 };
 
@@ -38,6 +39,7 @@ pub enum PlaygroundTarget {
 pub struct Playground {
     home: PathBuf,
     pub root: PathBuf,
+    config: Config,
     _lock: File,
 }
 
@@ -53,9 +55,14 @@ impl Playground {
         }
         let lock_path = home.join(".cargo-play.lock");
         let _lock = spawn_blocking(move || lock_home(&lock_path)).await??;
-        prepare_config(&home, create).await?;
+        let config = Config::load(&home, create).await?;
         let root = home.join("play");
-        Ok(Self { home, root, _lock })
+        Ok(Self {
+            home,
+            root,
+            config,
+            _lock,
+        })
     }
 
     pub async fn init(&self) -> Result<()> {
@@ -91,12 +98,17 @@ impl Playground {
         deps: &[String],
         force: bool,
     ) -> Result<()> {
-        let existing = directory_exists(&self.root).await?;
-        self.prepare_history().await?;
         let state = State::open(&self.home).await?;
         let current = state.active().await?;
-        self.check_replacement(existing, current.as_ref(), force, "new")
+        // Compare against the same instant used for the newly archived playground's visit time.
+        let archived_at = self
+            .archive_and_clear(&state, current.as_ref(), force, "new")
             .await?;
+        if let Some(limits) = &self.config.auto_delete {
+            self.prune_archives(&state, limits, archived_at)
+                .await
+                .context("自动清理归档失败")?;
+        }
         let package = state.next_default_name(base).await?;
         let display_name = name.unwrap_or(&package);
         let id = Uuid::new_v4();
@@ -119,14 +131,8 @@ impl Playground {
             close_tempdir(staging).await;
             return Err(error);
         }
-        self.replace_worktree(
-            &state,
-            staging,
-            existing,
-            current.as_ref(),
-            Some((id, display_name)),
-        )
-        .await?;
+        self.replace_worktree(&state, staging, true, None, Some((id, display_name)))
+            .await?;
         println!("已创建试验 {display_name:?} ({id})");
         if !deps.is_empty() {
             println!("已提交依赖 {}", deps.join(", "));
@@ -185,7 +191,7 @@ impl Playground {
         current: Option<&PlaygroundRecord>,
         force: bool,
         action: &str,
-    ) -> Result<()> {
+    ) -> Result<Timestamp> {
         let existing = directory_exists(&self.root).await?;
         self.check_replacement(existing, current, force, action)
             .await?;

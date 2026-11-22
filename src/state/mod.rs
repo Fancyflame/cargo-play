@@ -69,15 +69,9 @@ impl State {
         unreachable!("the sequence of default names is unbounded")
     }
 
-    pub async fn stage_switch(
-        &self,
-        id: Uuid,
-        name: &str,
-        archive: Option<&ArchiveRecord>,
-    ) -> Result<DatabaseTransaction> {
+    pub async fn stage_new(&self, id: Uuid, name: &str) -> Result<DatabaseTransaction> {
         async {
             let txn = self.0.begin().await?;
-            Self::record_archive(&txn, archive).await?;
             playground::ActiveModel {
                 id: Set(id),
                 name: Set(name.to_owned()),
@@ -96,10 +90,20 @@ impl State {
     pub async fn stage_clear(
         &self,
         archive: Option<&ArchiveRecord>,
+        archived_at: Timestamp,
     ) -> Result<DatabaseTransaction> {
         async {
             let txn = self.0.begin().await?;
-            Self::record_archive(&txn, archive).await?;
+            if let Some(archive) = archive {
+                playground::ActiveModel {
+                    id: Set(archive.id),
+                    archived_path: Set(Some(archive.path.clone())),
+                    last_visit_time: Set(archived_at.to_string()),
+                    ..Default::default()
+                }
+                .update(&txn)
+                .await?;
+            }
             current::Entity::delete_by_id(1).exec(&txn).await?;
             Ok::<_, sea_orm::DbErr>(txn)
         }
@@ -137,22 +141,6 @@ impl State {
         }
         .await
         .with_context(|| format!("记录游乐场 {id} 的访问失败"))
-    }
-
-    async fn record_archive(
-        txn: &DatabaseTransaction,
-        archive: Option<&ArchiveRecord>,
-    ) -> Result<(), sea_orm::DbErr> {
-        if let Some(archive) = archive {
-            playground::ActiveModel {
-                id: Set(archive.id),
-                archived_path: Set(Some(archive.path.clone())),
-                ..Default::default()
-            }
-            .update(txn)
-            .await?;
-        }
-        Ok(())
     }
 
     async fn set_current(db: &impl ConnectionTrait, id: Uuid) -> Result<(), sea_orm::DbErr> {
