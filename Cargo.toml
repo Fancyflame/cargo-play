@@ -14,6 +14,7 @@ anyhow = "1"
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-uuid"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt"] }
 uuid = { version = "1", features = ["v4"] }
+comfy-table = { version = "7.2.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

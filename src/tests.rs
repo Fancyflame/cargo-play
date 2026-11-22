@@ -12,8 +12,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::{
-    Action, Cli, Playground, default_package_name, run,
-    state::{NameMatch, PlaygroundRecord, State},
+    Action, Cli, Playground, default_package_name, list_playgrounds, run,
+    state::{ArchiveRecord, NameMatch, PlaygroundRecord, State},
 };
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -268,6 +268,8 @@ fn not_opened(_: &Path) -> anyhow::Result<()> {
 fn parses_cli() {
     let cli = Cli::try_parse_from(["cargo-play", "open"]).unwrap();
     assert!(matches!(cli.command, Action::Open));
+    let cli = Cli::try_parse_from(["cargo-play", "list"]).unwrap();
+    assert!(matches!(cli.command, Action::List));
     assert!(Cli::try_parse_from(["cargo-play", "new", "-d"]).is_err());
     assert!(Cli::try_parse_from(["cargo-play", "backup", "-d", "serde"]).is_err());
     let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde@1", "anyhow"]).unwrap();
@@ -280,6 +282,122 @@ fn parses_cli() {
             matches!(cli.command, Action::New { deps, name: None, force: true } if deps == ["serde"])
         );
     }
+}
+
+fn table_rows(table: &str) -> Vec<Vec<&str>> {
+    table
+        .lines()
+        .filter(|line| line.starts_with('│'))
+        .map(|line| line.trim_matches('│').split('┆').map(str::trim).collect())
+        .collect()
+}
+
+#[test]
+fn lists_current_then_archives_by_timestamp_and_uuid() {
+    let fixture = Fixture::empty();
+    let latest = Uuid::from_u128(4);
+    let tied_first = Uuid::from_u128(2);
+    let tied_second = Uuid::from_u128(3);
+    let oldest = Uuid::from_u128(1);
+    let current = Uuid::from_u128(5);
+    let table = block_on(async {
+        let state = State::open(&fixture.home).await.unwrap();
+        let mut previous = None;
+        for (id, name, timestamp) in [
+            (tied_second, "重名", "2025-02-02T18:04:05Z"),
+            (latest, "重名", "2025-02-02T18:04:05.9Z"),
+            (oldest, "旧试验", "2025-02-01T18:04:05Z"),
+            (tied_first, "Rust", "2025-02-02T18:04:05Z"),
+        ] {
+            state
+                .stage_switch(id, name, previous.as_ref())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            previous = Some(ArchiveRecord {
+                id,
+                path: format!("history/{id}.bundle"),
+                timestamp: timestamp.into(),
+            });
+        }
+        state
+            .stage_switch(current, "当前项目\n\x1b", previous.as_ref())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let before = fs::read(fixture.home.join("workspace.sqlite3")).unwrap();
+        let time_zone = tz::offset(8).to_time_zone();
+        let table = list_playgrounds(&fixture.home, &time_zone).await.unwrap();
+        assert_eq!(
+            fs::read(fixture.home.join("workspace.sqlite3")).unwrap(),
+            before
+        );
+        assert!(!fixture.home.join(".cargo-play.lock").exists());
+        table
+    });
+    assert_eq!(
+        table_rows(&table),
+        [
+            ["名称", "ID", "日期"],
+            [r"当前项目\n\u{1b}", &current.to_string(), "当前"],
+            ["重名", &latest.to_string(), "2025-02-03 02:04:05 +08:00"],
+            [
+                "Rust",
+                &tied_first.to_string(),
+                "2025-02-03 02:04:05 +08:00"
+            ],
+            [
+                "重名",
+                &tied_second.to_string(),
+                "2025-02-03 02:04:05 +08:00"
+            ],
+            ["旧试验", &oldest.to_string(), "2025-02-02 02:04:05 +08:00"],
+        ]
+    );
+    assert!(!table.contains('\x1b'));
+}
+
+#[test]
+fn lists_only_headers_for_an_empty_database() {
+    let fixture = Fixture::empty();
+    let table = block_on(async {
+        State::open(&fixture.home).await.unwrap();
+        list_playgrounds(&fixture.home, &tz::TimeZone::UTC)
+            .await
+            .unwrap()
+    });
+    assert_eq!(table_rows(&table), [["名称", "ID", "日期"]]);
+}
+
+#[test]
+fn list_requires_initialization_without_creating_state() {
+    let fixture = Fixture::empty();
+    let error = fixture.run(Action::List, not_opened).unwrap_err();
+    assert!(error.to_string().contains("cargo-play init"));
+    assert_eq!(fs::read_dir(&fixture.home).unwrap().count(), 1);
+}
+
+#[test]
+fn list_reports_the_id_with_an_invalid_archive_timestamp() {
+    let fixture = Fixture::empty();
+    let id = Uuid::from_u128(1);
+    let error = block_on(async {
+        let state = State::open(&fixture.home).await.unwrap();
+        state.connection().execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO playgrounds (id, name, archived_path, archived_at) VALUES (?, '测试', 'history/old.bundle', 'invalid')",
+            [id.into()],
+        )).await.unwrap();
+        list_playgrounds(&fixture.home, &tz::TimeZone::UTC)
+            .await
+            .unwrap_err()
+    });
+    assert!(error.to_string().contains("归档时间无效"));
+    assert!(error.to_string().contains(&id.to_string()));
 }
 
 #[test]

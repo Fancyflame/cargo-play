@@ -7,7 +7,8 @@ use std::{env, ffi::OsString, path::Path, process::ExitCode};
 
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
-use jiff::Zoned;
+use comfy_table::{Table, presets::UTF8_FULL_CONDENSED};
+use jiff::{Zoned, tz::TimeZone};
 use repository::{Playground, directory_exists};
 
 #[derive(Parser)]
@@ -39,6 +40,8 @@ enum Action {
     Open,
     /// 提交当前试验的改动
     Backup,
+    /// 列出当前的游乐场和归档记录，归档记录按时间倒序排列
+    List,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -84,6 +87,11 @@ async fn run(
             open_with_warning(&folder, open).await;
         }
         Action::Backup => Playground::open(home, false).await?.backup().await?,
+        Action::List => {
+            let home = config::resolve_home(home)?;
+            let table = list_playgrounds(&home, &TimeZone::system()).await?;
+            println!("{table}");
+        }
         Action::New { deps, name, force } => {
             let playground = Playground::open(home, true).await?;
             playground
@@ -100,6 +108,33 @@ async fn run(
         }
     }
     Ok(())
+}
+
+async fn list_playgrounds(home: &Path, time_zone: &TimeZone) -> Result<String> {
+    let entries = state::State::list(home).await?;
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_header(["名称", "ID", "日期"]);
+    for entry in entries {
+        let mut alias = String::new();
+        for ch in entry.name.chars() {
+            if ch.is_control() {
+                alias.extend(ch.escape_debug());
+            } else {
+                alias.push(ch);
+            }
+        }
+        let date = match entry.archived_at {
+            Some(timestamp) => timestamp
+                .to_zoned(time_zone.clone())
+                .strftime("%Y-%m-%d %H:%M:%S %:z")
+                .to_string(),
+            None => "当前".to_owned(),
+        };
+        table.add_row([alias, entry.id.to_string(), date]);
+    }
+    Ok(table.to_string())
 }
 
 async fn open_with_warning(folder: &Path, open: impl AsyncFnOnce(&Path) -> Result<()>) {

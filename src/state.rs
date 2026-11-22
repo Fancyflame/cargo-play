@@ -1,9 +1,11 @@
-use std::path::Path;
+use std::{cmp::Reverse, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+use jiff::Timestamp;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, QueryFilter, QuerySelect, Set, SqlxSqliteConnector, TransactionTrait,
+    DbBackend, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Set, SqlxSqliteConnector,
+    Statement, TransactionTrait,
     sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use uuid::Uuid;
@@ -77,20 +79,23 @@ pub struct ArchiveRecord {
     pub timestamp: String,
 }
 
+pub struct PlaygroundListEntry {
+    pub id: Uuid,
+    pub name: String,
+    pub archived_at: Option<Timestamp>,
+}
+
+#[derive(FromQueryResult)]
+struct PlaygroundListRow {
+    id: Uuid,
+    name: String,
+    archived_at: Option<String>,
+}
+
 impl State {
     pub async fn open(home: &Path) -> Result<Self> {
         let path = home.join(DB_FILE);
-        // A filename passed directly to SQLite avoids URL escaping of the home path.
-        let options = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .with_context(|| format!("打开状态数据库 {} 失败", path.display()))?;
-        let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+        let db = Self::connect(&path, false).await?;
         async {
             let txn = db.begin().await?;
             for stmt in SCHEMA {
@@ -101,6 +106,65 @@ impl State {
         .await
         .with_context(|| format!("初始化状态数据库 {} 失败", path.display()))?;
         Ok(Self(db))
+    }
+
+    async fn connect(path: &Path, read_only: bool) -> Result<DatabaseConnection> {
+        // A filename passed directly to SQLite avoids URL escaping of the home path.
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(read_only)
+            .create_if_missing(!read_only)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .with_context(|| format!("打开状态数据库 {} 失败", path.display()))?;
+        Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
+    }
+
+    pub async fn list(home: &Path) -> Result<Vec<PlaygroundListEntry>> {
+        let path = home.join(DB_FILE);
+        ensure!(
+            tokio::fs::try_exists(&path)
+                .await
+                .with_context(|| format!("检查状态数据库 {} 失败", path.display()))?,
+            "首次使用请运行 cargo-play init。"
+        );
+        let db = Self::connect(&path, true).await?;
+        let rows = PlaygroundListRow::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT p.id, p.name, CASE WHEN c.slot IS NULL THEN p.archived_at END AS archived_at
+             FROM playgrounds AS p
+             LEFT JOIN current_playground AS c ON c.slot = 1 AND c.playground_id = p.id
+             WHERE c.slot IS NOT NULL OR p.archived_at IS NOT NULL",
+        ))
+        .all(&db)
+        .await
+        .context("读取游乐场列表失败")?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let archived_at = row
+                .archived_at
+                .as_deref()
+                .map(str::parse::<Timestamp>)
+                .transpose()
+                .with_context(|| format!("游乐场 {} 的归档时间无效", row.id))?;
+            entries.push(PlaygroundListEntry {
+                id: row.id,
+                name: row.name,
+                archived_at,
+            });
+        }
+        entries.sort_unstable_by_key(|entry| {
+            (
+                entry.archived_at.is_some(),
+                Reverse(entry.archived_at),
+                entry.id,
+            )
+        });
+        Ok(entries)
     }
 
     pub async fn active(&self) -> Result<Option<PlaygroundRecord>> {
