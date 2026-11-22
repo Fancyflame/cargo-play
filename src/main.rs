@@ -63,6 +63,14 @@ enum Action {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// 归档当前试验并清空 play 文件夹
+    ///
+    /// Git 忽略的文件随旧工作区清理。
+    Clear {
+        /// 允许丢弃未登记的工作区内容
+        #[arg(short, long)]
+        force: bool,
+    },
     /// 打开当前试验文件夹
     Open,
     /// 提交当前试验的改动
@@ -132,6 +140,7 @@ async fn run(
             open_play_folder(&folder, open).await?;
         }
         Action::Backup => Playground::open(home, false).await?.backup().await?,
+        Action::Clear { force } => Playground::open(home, false).await?.clear(force).await?,
         Action::List { offset } => {
             let home = config::resolve_home(home)?;
             let table = list_playgrounds(&home, &TimeZone::system(), offset).await?;

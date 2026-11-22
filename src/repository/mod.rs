@@ -1,4 +1,4 @@
-//! 游乐场仓库的入口，负责打开和初始化仓库，以及新建和恢复游乐场。
+//! 游乐场仓库的入口，负责打开和初始化仓库，以及新建、清场和恢复游乐场。
 
 mod deletion;
 mod filesystem;
@@ -134,6 +134,15 @@ impl Playground {
         Ok(())
     }
 
+    pub async fn clear(&self, force: bool) -> Result<()> {
+        let state = State::open_existing(&self.home).await?;
+        let current = state.active().await?;
+        self.archive_and_clear(&state, current.as_ref(), force, "clear")
+            .await?;
+        println!("已清空工作区：{}", self.root.display());
+        Ok(())
+    }
+
     pub async fn resume(&self, target: PlaygroundTarget, force: bool) -> Result<()> {
         let state = State::open_existing(&self.home).await?;
         let current = state.active().await?;
@@ -145,16 +154,7 @@ impl Playground {
         let bundle = target
             .archived_path
             .with_context(|| format!("游乐场 {id} 没有归档"))?;
-        let existing = directory_exists(&self.root).await?;
-        self.check_replacement(existing, current.as_ref(), force, "resume")
-            .await?;
-        self.prepare_history().await?;
-
-        let staging = temporary_dir(Some(&self.home), ".cargo-play-resume-").await?;
-        fs::create_dir(staging.path().join("next"))
-            .await
-            .context("创建空工作区失败")?;
-        self.replace_worktree(&state, staging, existing, current.as_ref(), None)
+        self.archive_and_clear(&state, current.as_ref(), force, "resume")
             .await?;
 
         // Clearing the active record first keeps the previous project available in history
@@ -180,6 +180,26 @@ impl Playground {
         state.activate(id).await?;
         println!("已恢复试验 {:?} ({id})", target.name);
         Ok(())
+    }
+
+    async fn archive_and_clear(
+        &self,
+        state: &State,
+        current: Option<&PlaygroundRecord>,
+        force: bool,
+        action: &str,
+    ) -> Result<()> {
+        let existing = directory_exists(&self.root).await?;
+        self.check_replacement(existing, current, force, action)
+            .await?;
+        self.prepare_history().await?;
+
+        let staging = temporary_dir(Some(&self.home), ".cargo-play-clear-").await?;
+        fs::create_dir(staging.path().join("next"))
+            .await
+            .context("创建空工作区失败")?;
+        self.replace_worktree(state, staging, existing, current, None)
+            .await
     }
 
     async fn resolve_target(state: &State, target: PlaygroundTarget) -> Result<PlaygroundRecord> {

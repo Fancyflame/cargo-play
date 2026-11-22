@@ -271,6 +271,8 @@ fn not_opened(_: &Path) -> anyhow::Result<()> {
 fn parses_cli() {
     let cli = Cli::try_parse_from(["cgpl", "open"]).unwrap();
     assert!(matches!(cli.command, Action::Open));
+    let cli = Cli::try_parse_from(["cgpl", "clear"]).unwrap();
+    assert!(matches!(cli.command, Action::Clear { force: false }));
     let cli = Cli::try_parse_from(["cgpl", "list"]).unwrap();
     assert!(matches!(cli.command, Action::List { offset: 0 }));
     let cli = Cli::try_parse_from(["cgpl", "list", "--offset", "50"]).unwrap();
@@ -303,6 +305,8 @@ fn parses_cli() {
         );
     }
     for flag in ["-f", "--force"] {
+        let cli = Cli::try_parse_from(["cgpl", "clear", flag]).unwrap();
+        assert!(matches!(cli.command, Action::Clear { force: true }));
         let cli = Cli::try_parse_from(["cgpl", "resume", &uuid, flag]).unwrap();
         assert!(
             matches!(cli.command, Action::Resume { target: PlaygroundTarget::Id(parsed), force: true } if parsed == id)
@@ -1135,6 +1139,92 @@ fn resuming_the_current_playground_updates_its_visit_time_and_opens_it() {
     assert_eq!(fs::read_to_string(marker).unwrap(), "invalid marker");
     assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
     fixture.assert_no_archives();
+}
+
+#[test]
+fn clear_archives_pending_work_and_leaves_play_empty() {
+    let fixture = Fixture::previous_trial();
+    let id = fixture.active().id;
+    fs::write(fixture.play.join("old.txt"), "updated").unwrap();
+    fs::write(fixture.play.join("draft.txt"), "untracked draft").unwrap();
+
+    fixture
+        .run(Action::Clear { force: true }, not_opened)
+        .unwrap();
+    assert_eq!(fs::read_dir(&fixture.play).unwrap().count(), 0);
+    assert!(block_on(async {
+        State::open_existing(&fixture.home)
+            .await
+            .unwrap()
+            .active()
+            .await
+            .unwrap()
+            .is_none()
+    }));
+    let archive = fixture.archive_at("old-trial");
+    assert!(archive.is_file());
+
+    fixture
+        .run(Action::Clear { force: false }, not_opened)
+        .unwrap();
+    assert_eq!(fs::read_dir(&fixture.play).unwrap().count(), 0);
+    fixture
+        .run(
+            Action::Resume {
+                target: PlaygroundTarget::Id(id),
+                force: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fixture.active().id, id);
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("old.txt")).unwrap(),
+        "updated"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("draft.txt")).unwrap(),
+        "untracked draft"
+    );
+}
+
+#[test]
+fn clear_requires_force_to_discard_unregistered_contents() {
+    let fixture = Fixture::empty();
+    fixture.run(Action::Init, not_opened).unwrap();
+    let unregistered = fixture.play.join("unregistered.txt");
+    fs::write(&unregistered, "keep me").unwrap();
+    let error = fixture
+        .run(Action::Clear { force: false }, not_opened)
+        .unwrap_err();
+    assert!(error.to_string().contains("cgpl clear --force"));
+    assert_eq!(fs::read_to_string(unregistered).unwrap(), "keep me");
+
+    fixture
+        .run(Action::Clear { force: true }, not_opened)
+        .unwrap();
+    assert_eq!(fs::read_dir(&fixture.play).unwrap().count(), 0);
+    fixture.assert_no_archives();
+}
+
+#[test]
+fn clear_restores_worktree_if_archive_cannot_be_published() {
+    let fixture = Fixture::previous_trial();
+    let current = fixture.active();
+    let blocked = fixture.home.join(format!("history/{}.bundle", current.id));
+    fs::create_dir(&blocked).unwrap();
+    fs::write(fixture.play.join("draft.txt"), "still here").unwrap();
+
+    let error = fixture
+        .run(Action::Clear { force: true }, not_opened)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("归档路径"));
+    assert!(blocked.is_dir());
+    assert_eq!(fixture.active(), current);
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("draft.txt")).unwrap(),
+        "still here"
+    );
 }
 
 #[test]
