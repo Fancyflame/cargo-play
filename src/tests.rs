@@ -273,7 +273,21 @@ fn not_opened(_: &Path) -> anyhow::Result<()> {
 #[test]
 fn parses_cli() {
     let cli = Cli::try_parse_from(["cgpl", "open"]).unwrap();
-    assert!(matches!(cli.command, Action::Open));
+    assert!(matches!(
+        cli.command,
+        Action::Open {
+            target: None,
+            force: false
+        }
+    ));
+    let cli = Cli::try_parse_from(["cgpl", "open", "12"]).unwrap();
+    assert!(
+        matches!(cli.command, Action::Open { target: Some(PlaygroundTarget::Position(position)), force: false } if position.get() == 12)
+    );
+    assert!(matches!(
+        Cli::try_parse_from(["cgpl", "resume", "12"]),
+        Err(error) if error.kind() == clap::error::ErrorKind::InvalidSubcommand
+    ));
     let cli = Cli::try_parse_from(["cgpl", "clear"]).unwrap();
     assert!(matches!(cli.command, Action::Clear { force: false }));
     let cli = Cli::try_parse_from(["cgpl", "list"]).unwrap();
@@ -289,30 +303,33 @@ fn parses_cli() {
     );
     let id = Uuid::new_v4();
     let uuid = id.to_string();
-    let cli = Cli::try_parse_from(["cgpl", "resume", &uuid]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "open", &uuid]).unwrap();
     assert!(
-        matches!(cli.command, Action::Resume { target: PlaygroundTarget::Id(parsed), force: false } if parsed == id)
+        matches!(cli.command, Action::Open { target: Some(PlaygroundTarget::Id(parsed)), force: false } if parsed == id)
     );
-    let cli = Cli::try_parse_from(["cgpl", "resume", "10000", "--force"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "open", "10000", "--force"]).unwrap();
     assert!(
-        matches!(cli.command, Action::Resume { target: PlaygroundTarget::Position(position), force: true } if position.get() == 10000)
+        matches!(cli.command, Action::Open { target: Some(PlaygroundTarget::Position(position)), force: true } if position.get() == 10000)
     );
-    let cli = Cli::try_parse_from(["cgpl", "resume", "00000000000000000000000000000001"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "open", "00000000000000000000000000000001"]).unwrap();
     assert!(
-        matches!(cli.command, Action::Resume { target: PlaygroundTarget::Id(id), .. } if id == Uuid::from_u128(1))
+        matches!(cli.command, Action::Open { target: Some(PlaygroundTarget::Id(id)), .. } if id == Uuid::from_u128(1))
     );
     for invalid in ["0", "-1", "1.5", "18446744073709551616", "not-a-uuid"] {
         assert!(
-            Cli::try_parse_from(["cgpl", "resume", invalid]).is_err(),
+            Cli::try_parse_from(["cgpl", "open", invalid]).is_err(),
             "{invalid}"
         );
     }
     for flag in ["-f", "--force"] {
+        assert!(
+            matches!(Cli::try_parse_from(["cgpl", "open", flag]), Err(error) if error.kind() == clap::error::ErrorKind::MissingRequiredArgument)
+        );
         let cli = Cli::try_parse_from(["cgpl", "clear", flag]).unwrap();
         assert!(matches!(cli.command, Action::Clear { force: true }));
-        let cli = Cli::try_parse_from(["cgpl", "resume", &uuid, flag]).unwrap();
+        let cli = Cli::try_parse_from(["cgpl", "open", &uuid, flag]).unwrap();
         assert!(
-            matches!(cli.command, Action::Resume { target: PlaygroundTarget::Id(parsed), force: true } if parsed == id)
+            matches!(cli.command, Action::Open { target: Some(PlaygroundTarget::Id(parsed)), force: true } if parsed == id)
         );
         let cli = Cli::try_parse_from(["cgpl", "new", "-d", "serde", flag]).unwrap();
         assert!(
@@ -500,11 +517,17 @@ fn opens_existing_folder_directly() {
     fs::create_dir(&fixture.play).unwrap();
     let mut opened = false;
     fixture
-        .run(Action::Open, |path| {
-            assert_eq!(path, fixture.play);
-            opened = true;
-            Ok(())
-        })
+        .run(
+            Action::Open {
+                target: None,
+                force: false,
+            },
+            |path| {
+                assert_eq!(path, fixture.play);
+                opened = true;
+                Ok(())
+            },
+        )
         .unwrap();
     assert!(opened);
     assert!(fs::read_dir(&fixture.play).unwrap().next().is_none());
@@ -515,7 +538,15 @@ fn opens_existing_folder_directly() {
 #[test]
 fn open_requires_an_existing_folder() {
     let fixture = Fixture::empty();
-    let error = fixture.run(Action::Open, not_opened).unwrap_err();
+    let error = fixture
+        .run(
+            Action::Open {
+                target: None,
+                force: false,
+            },
+            not_opened,
+        )
+        .unwrap_err();
     assert!(error.to_string().contains("找不到试验文件夹"));
     assert!(!fixture.play.exists());
 }
@@ -688,8 +719,8 @@ fn invalid_manifest_is_archived_using_the_stored_name() {
     assert!(fixture.archive_at("old-trial").is_file());
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: false,
             },
             |_| Ok(()),
@@ -798,8 +829,8 @@ fn new_archives_git_history_and_keeps_the_registered_name() {
 
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1003,8 +1034,8 @@ fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_fail
     );
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1053,8 +1084,8 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
     let before_resume = Timestamp::now();
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(original.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(original.id)),
                 force: true,
             },
             |path| {
@@ -1103,8 +1134,8 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
 
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(other.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(other.id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1125,8 +1156,8 @@ fn resumes_archived_projects_and_preserves_their_identity_and_history() {
 
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(original.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(original.id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1196,7 +1227,7 @@ fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
         }
     });
     for position in ["10003", "18446744073709551615"] {
-        let action = Cli::try_parse_from(["cgpl", "resume", position])
+        let action = Cli::try_parse_from(["cgpl", "open", position])
             .unwrap()
             .command;
         let error = fixture.run(action, not_opened).unwrap_err();
@@ -1207,7 +1238,7 @@ fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
         );
         assert_eq!(fixture.active(), current);
     }
-    let action = Cli::try_parse_from(["cgpl", "resume", "10002"])
+    let action = Cli::try_parse_from(["cgpl", "open", "10002"])
         .unwrap()
         .command;
     fixture
@@ -1238,8 +1269,8 @@ fn resuming_the_current_playground_updates_its_visit_time_and_opens_it() {
         let before_resume = Timestamp::now();
         fixture
             .run(
-                Action::Resume {
-                    target,
+                Action::Open {
+                    target: Some(target),
                     force: false,
                 },
                 |path| {
@@ -1292,8 +1323,8 @@ fn clear_archives_pending_work_and_leaves_play_empty() {
     assert_eq!(fs::read_dir(&fixture.play).unwrap().count(), 0);
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1352,7 +1383,7 @@ fn clear_restores_worktree_if_archive_cannot_be_published() {
 }
 
 #[test]
-fn resume_requires_force_to_discard_an_unregistered_workspace() {
+fn opening_a_target_requires_force_to_discard_an_unregistered_workspace() {
     let fixture = Fixture::previous_trial();
     let id = fixture.active().id;
     fixture.run(new(&[]), |_| Ok(())).unwrap();
@@ -1374,20 +1405,24 @@ fn resume_requires_force_to_discard_an_unregistered_workspace() {
     .unwrap();
     let error = fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: false,
             },
             not_opened,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("cgpl resume --force"));
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("cgpl open {id} --force"))
+    );
     assert!(fixture.play.join("unregistered.txt").is_file());
 
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Position(NonZeroU64::new(2).unwrap()),
+            Action::Open {
+                target: Some(PlaygroundTarget::Position(NonZeroU64::new(2).unwrap())),
                 force: true,
             },
             |_| Ok(()),
@@ -1404,8 +1439,8 @@ fn unknown_uuid_does_not_clear_the_current_workspace() {
     let id = Uuid::new_v4();
     let error = fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: true,
             },
             not_opened,
@@ -1429,8 +1464,8 @@ fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
 
     let error = fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(target.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(target.id)),
                 force: false,
             },
             not_opened,
@@ -1445,8 +1480,8 @@ fn failed_resume_leaves_the_previous_project_archived_and_recoverable() {
     assert!(fixture.archive_at(&previous.name).is_file());
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(previous.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(previous.id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1486,8 +1521,8 @@ fn failed_snapshot_apply_leaves_play_empty_and_the_previous_project_recoverable(
 
     let error = fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(target.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(target.id)),
                 force: false,
             },
             not_opened,
@@ -1509,8 +1544,8 @@ fn failed_snapshot_apply_leaves_play_empty_and_the_previous_project_recoverable(
     });
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(previous.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(previous.id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1553,8 +1588,8 @@ fn locks_mutating_commands_at_home() {
         Action::Init,
         Action::Backup,
         new(&[]),
-        Action::Resume {
-            target: PlaygroundTarget::Id(id),
+        Action::Open {
+            target: Some(PlaygroundTarget::Id(id)),
             force: false,
         },
         Action::Delete {
@@ -1625,8 +1660,8 @@ fn clear_archives_untracked_files_without_running_a_commit() {
         .unwrap();
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: false,
             },
             |_| Ok(()),
@@ -1701,8 +1736,8 @@ fn cargo_failure_leaves_old_project_archived_and_play_empty() {
     assert!(fixture.archive_at("old-trial").is_file());
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(id)),
                 force: false,
             },
             |_| Ok(()),

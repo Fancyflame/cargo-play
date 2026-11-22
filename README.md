@@ -35,7 +35,7 @@ cgpl backup
 ```powershell
 cgpl clear
 cgpl list
-cgpl resume 1
+cgpl open 1
 ```
 
 也可以新建下一个试验并一次添加多个依赖。`new` 会先归档当前试验，再调用 `cargo add` 添加并提交依赖。
@@ -51,17 +51,16 @@ cgpl new --name 'Serde demo' --deps serde@1 serde_json
 | `cgpl init` | 初始化配置、SQLite 数据库、`play/` 和 `history/`。 |
 | `cgpl new [--name <名称>] [-d <依赖>...]` | 归档当前试验，创建新项目并打开目录。依赖支持 `crate` 或 `crate@版本`。 |
 | `cgpl list [--offset <条数>]` | 按上次访问时间倒序列出试验，每次最多 50 条。用 `--offset 50` 查看第二页。 |
-| `cgpl resume <序号或UUID>` | 归档当前试验，恢复并打开指定试验。 |
-| `cgpl open` | 打开 `play/`。优先使用 VS Code，其次使用系统默认方式。 |
+| `cgpl open [序号或UUID] [-f]` | 省略目标时直接打开 `play/`。指定目标时归档当前试验，再切换并打开目标。`-f` 或 `--force` 需要指定目标。打开目录时优先使用 VS Code，其次使用系统默认方式。 |
 | `cgpl backup` | 把当前改动提交到本地 Git 仓库。Git Bundle 在归档时写入。 |
 | `cgpl clear` | 归档当前试验并清空 `play/`。 |
 | `cgpl delete [序号或UUID] [-y]` | 永久删除指定试验及其归档。省略目标时删除当前试验。默认交互确认，`-y` 或 `--yes` 跳过确认。 |
 
 列表序号从 1 开始，翻页后继续使用全库序号。列表顺序可能随恢复或删除而变化，脚本中可使用 UUID 精确指定目标。运行 `cgpl <命令> --help` 可以查看选项。
 
-> **清场前请检查需要保留的文件。** Bundle 包含当前分支的提交历史和未提交改动的快照。`target/` 等未被 Git 跟踪的忽略文件会随旧工作区一起清理。`new`、`resume` 和 `clear` 默认会保护未登记的工作区内容，确认可以丢弃这些内容后再使用 `--force`。
+> **清场前请检查需要保留的文件。** Bundle 包含当前分支的提交历史和未提交改动的快照。`target/` 等未被 Git 跟踪的忽略文件会随旧工作区一起清理。`new`、指定目标的 `open` 和 `clear` 默认会保护未登记的工作区内容，确认可以丢弃这些内容后再使用 `--force`。
 
-如果 `cargo init` 或 `cargo add` 在清场后失败，`play/` 可能已经清空。可以用 `cgpl list` 找到上一份仍保留的归档，再用 `cgpl resume` 恢复。
+如果 `cargo init` 或 `cargo add` 在清场后失败，`play/` 可能已经清空。可以用 `cgpl list` 找到上一份仍保留的归档，再用 `cgpl open <序号或UUID>` 恢复。
 
 ## 数据与自动清理
 

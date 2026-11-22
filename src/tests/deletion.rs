@@ -128,8 +128,8 @@ fn deletes_the_current_playground_and_its_old_bundle_without_a_target() {
     let other = fixture.active();
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(original.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(original.id)),
                 force: false,
             },
             |_| Ok(()),
@@ -166,8 +166,8 @@ fn deletes_the_current_playground_and_its_old_bundle_without_a_target() {
     assert!(error.to_string().contains("没有当前游乐场"));
     fixture
         .run(
-            Action::Resume {
-                target: PlaygroundTarget::Id(other.id),
+            Action::Open {
+                target: Some(PlaygroundTarget::Id(other.id)),
                 force: false,
             },
             |_| Ok(()),

@@ -160,7 +160,7 @@ impl Playground {
         let bundle = target
             .archived_path
             .with_context(|| format!("游乐场 {id} 没有归档"))?;
-        self.archive_and_clear(&state, current.as_ref(), force, "resume")
+        self.archive_and_clear(&state, current.as_ref(), force, &format!("open {id}"))
             .await?;
 
         let bundle = self.home.join(bundle);

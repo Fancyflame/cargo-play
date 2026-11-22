@@ -45,15 +45,6 @@ enum Action {
         #[arg(short, long)]
         force: bool,
     },
-    /// 归档当前试验，按序号或 UUID 恢复游乐场并打开项目文件夹
-    Resume {
-        /// 从 1 开始的全库序号，或游乐场 UUID，可通过 list 查看
-        #[arg(value_name = "序号或UUID", allow_negative_numbers = true)]
-        target: PlaygroundTarget,
-        /// 允许替换未登记的旧工作区
-        #[arg(short, long)]
-        force: bool,
-    },
     /// 永久删除游乐场，省略目标时删除当前游乐场
     Delete {
         /// 从 1 开始的全库序号，或游乐场 UUID，可通过 list 查看
@@ -71,8 +62,15 @@ enum Action {
         #[arg(short, long)]
         force: bool,
     },
-    /// 打开当前试验文件夹
-    Open,
+    /// 打开当前试验；指定游乐场时先归档当前试验，再切换并打开
+    Open {
+        /// 从 1 开始的全库序号，或游乐场 UUID，可通过 list 查看
+        #[arg(value_name = "序号或UUID", allow_negative_numbers = true)]
+        target: Option<PlaygroundTarget>,
+        /// 切换时允许替换未登记的旧工作区
+        #[arg(short, long, requires = "target")]
+        force: bool,
+    },
     /// 提交当前试验的改动
     Backup,
     /// 按上次访问时间倒序列出游乐场，每次最多显示 50 条
@@ -130,8 +128,14 @@ async fn run(
             playground.init().await?;
             println!("试验目录已就绪：{}", playground.root.display());
         }
-        Action::Open => {
-            let folder = config::resolve_home(home)?.join("play");
+        Action::Open { target, force } => {
+            let folder = if let Some(target) = target {
+                let playground = Playground::open(home, false).await?;
+                playground.resume(target, force).await?;
+                playground.root.clone()
+            } else {
+                config::resolve_home(home)?.join("play")
+            };
             open_play_folder(&folder, open).await?;
         }
         Action::Backup => Playground::open(home, false).await?.backup().await?,
@@ -140,13 +144,6 @@ async fn run(
             let home = config::resolve_home(home)?;
             let table = list_playgrounds(&home, &TimeZone::system(), offset).await?;
             println!("{table}");
-        }
-        Action::Resume { target, force } => {
-            let playground = Playground::open(home, false).await?;
-            playground.resume(target, force).await?;
-            let folder = playground.root.clone();
-            drop(playground);
-            open_play_folder(&folder, open).await?;
         }
         Action::Delete { target, yes } => {
             let by_position = matches!(&target, Some(PlaygroundTarget::Position(_)));
