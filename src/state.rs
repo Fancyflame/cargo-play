@@ -142,7 +142,7 @@ impl State {
             tokio::fs::try_exists(&path)
                 .await
                 .with_context(|| format!("检查状态数据库 {} 失败", path.display()))?,
-            "首次使用请运行 cargo-play init。"
+            "首次使用请运行 cgpl init。"
         );
         Ok(path)
     }

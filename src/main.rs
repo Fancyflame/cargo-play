@@ -13,7 +13,7 @@ use repository::{Playground, ResumeTarget, directory_exists};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(version, about = "用 Git Bundle 归档 Rust 试验")]
+#[command(name = env!("CARGO_BIN_NAME"), version, about = "用 Git Bundle 归档 Rust 试验")]
 struct Cli {
     #[command(subcommand)]
     command: Action,
@@ -177,7 +177,7 @@ async fn open_play_folder(
 ) -> Result<()> {
     ensure!(
         directory_exists(folder).await?,
-        "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cargo-play init。",
+        "找不到试验文件夹 {}，请检查 CARGOPLAY_HOME 或运行 cgpl init。",
         folder.display()
     );
     open_with_warning(folder, open).await;

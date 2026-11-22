@@ -43,7 +43,7 @@ impl Playground {
                 .await
                 .with_context(|| format!("创建 {} 失败", home.display()))?;
         } else if !fs::metadata(&home).await.is_ok_and(|info| info.is_dir()) {
-            bail!("首次使用请运行 cargo-play init。");
+            bail!("首次使用请运行 cgpl init。");
         }
         let lock_path = home.join(".cargo-play.lock");
         let _lock = spawn_blocking(move || lock_home(&lock_path)).await??;
@@ -135,7 +135,7 @@ impl Playground {
             ResumeTarget::Id(id) => id,
             ResumeTarget::Position(position) => {
                 state.id_at_position(position).await?.with_context(|| {
-                    format!("找不到序号为 {position} 的游乐场，请运行 cargo-play list 查看。")
+                    format!("找不到序号为 {position} 的游乐场，请运行 cgpl list 查看。")
                 })?
             }
         };
@@ -197,7 +197,7 @@ impl Playground {
             self.verify_current(record.id).await?;
         } else if existing && !force && !worktree_is_empty(&self.root).await? {
             bail!(
-                "{} 包含未登记的项目。确认丢弃后可运行 cargo-play {action} --force。",
+                "{} 包含未登记的项目。确认丢弃后可运行 cgpl {action} --force。",
                 self.root.display()
             );
         }
@@ -523,7 +523,7 @@ impl<'a> Worktree<'a> {
         let git_dir = root.join(".git");
         if !directory_exists(root).await? || !directory_exists(&git_dir).await? {
             bail!(
-                "{} 必须包含独立的 .git 目录。首次使用请运行 cargo-play init。",
+                "{} 必须包含独立的 .git 目录。首次使用请运行 cgpl init。",
                 root.display()
             );
         }
@@ -804,7 +804,7 @@ fn lock_home(path: &Path) -> Result<File> {
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => {
-            bail!("试验仓库正在使用，请等另一条 cargo-play 命令结束后重试。")
+            bail!("试验仓库正在使用，请等另一条 cgpl 命令结束后重试。")
         }
         Err(TryLockError::Error(error)) => Err(error).context("锁定试验仓库失败"),
     }

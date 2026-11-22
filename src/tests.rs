@@ -267,46 +267,46 @@ fn not_opened(_: &Path) -> anyhow::Result<()> {
 
 #[test]
 fn parses_cli() {
-    let cli = Cli::try_parse_from(["cargo-play", "open"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "open"]).unwrap();
     assert!(matches!(cli.command, Action::Open));
-    let cli = Cli::try_parse_from(["cargo-play", "list"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "list"]).unwrap();
     assert!(matches!(cli.command, Action::List { offset: 0 }));
-    let cli = Cli::try_parse_from(["cargo-play", "list", "--offset", "50"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "list", "--offset", "50"]).unwrap();
     assert!(matches!(cli.command, Action::List { offset: 50 }));
-    assert!(Cli::try_parse_from(["cargo-play", "list", "--offset", "-1"]).is_err());
-    assert!(Cli::try_parse_from(["cargo-play", "new", "-d"]).is_err());
-    assert!(Cli::try_parse_from(["cargo-play", "backup", "-d", "serde"]).is_err());
-    let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde@1", "anyhow"]).unwrap();
+    assert!(Cli::try_parse_from(["cgpl", "list", "--offset", "-1"]).is_err());
+    assert!(Cli::try_parse_from(["cgpl", "new", "-d"]).is_err());
+    assert!(Cli::try_parse_from(["cgpl", "backup", "-d", "serde"]).is_err());
+    let cli = Cli::try_parse_from(["cgpl", "new", "-d", "serde@1", "anyhow"]).unwrap();
     assert!(
         matches!(cli.command, Action::New { deps, name: None, force: false } if deps == ["serde@1", "anyhow"])
     );
     let id = Uuid::new_v4();
     let uuid = id.to_string();
-    let cli = Cli::try_parse_from(["cargo-play", "resume", &uuid]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "resume", &uuid]).unwrap();
     assert!(
         matches!(cli.command, Action::Resume { target: ResumeTarget::Id(parsed), force: false } if parsed == id)
     );
-    let cli = Cli::try_parse_from(["cargo-play", "resume", "10000", "--force"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "resume", "10000", "--force"]).unwrap();
     assert!(
         matches!(cli.command, Action::Resume { target: ResumeTarget::Position(position), force: true } if position.get() == 10000)
     );
     let cli =
-        Cli::try_parse_from(["cargo-play", "resume", "00000000000000000000000000000001"]).unwrap();
+        Cli::try_parse_from(["cgpl", "resume", "00000000000000000000000000000001"]).unwrap();
     assert!(
         matches!(cli.command, Action::Resume { target: ResumeTarget::Id(id), .. } if id == Uuid::from_u128(1))
     );
     for invalid in ["0", "-1", "1.5", "18446744073709551616", "not-a-uuid"] {
         assert!(
-            Cli::try_parse_from(["cargo-play", "resume", invalid]).is_err(),
+            Cli::try_parse_from(["cgpl", "resume", invalid]).is_err(),
             "{invalid}"
         );
     }
     for flag in ["-f", "--force"] {
-        let cli = Cli::try_parse_from(["cargo-play", "resume", &uuid, flag]).unwrap();
+        let cli = Cli::try_parse_from(["cgpl", "resume", &uuid, flag]).unwrap();
         assert!(
             matches!(cli.command, Action::Resume { target: ResumeTarget::Id(parsed), force: true } if parsed == id)
         );
-        let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde", flag]).unwrap();
+        let cli = Cli::try_parse_from(["cgpl", "new", "-d", "serde", flag]).unwrap();
         assert!(
             matches!(cli.command, Action::New { deps, name: None, force: true } if deps == ["serde"])
         );
@@ -463,7 +463,7 @@ fn list_requires_initialization_without_creating_state() {
     let error = fixture
         .run(Action::List { offset: 0 }, not_opened)
         .unwrap_err();
-    assert!(error.to_string().contains("cargo-play init"));
+    assert!(error.to_string().contains("cgpl init"));
     assert_eq!(fs::read_dir(&fixture.home).unwrap().count(), 1);
 }
 
@@ -607,7 +607,7 @@ fn nonempty_play_without_manifest_requires_force_even_without_git() {
     assert!(error.to_string().contains("--force"));
     assert!(cache.is_file());
 
-    let cli = Cli::try_parse_from(["cargo-play", "new", "-f"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "new", "-f"]).unwrap();
     fixture.run(cli.command, |_| Ok(())).unwrap();
     assert!(!cache.exists());
     assert!(fixture.play.join("Cargo.toml").is_file());
@@ -666,7 +666,7 @@ fn first_new_requires_force_to_discard_legacy_projects() {
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
     assert!(error.to_string().contains("--force"));
     assert!(fixture.play.join("old.txt").is_file());
-    let cli = Cli::try_parse_from(["cargo-play", "new", "--force"]).unwrap();
+    let cli = Cli::try_parse_from(["cgpl", "new", "--force"]).unwrap();
     fixture.run(cli.command, |_| Ok(())).unwrap();
     fixture.assert_no_archives();
     assert!(!fixture.play.join("old.txt").exists());
@@ -767,7 +767,7 @@ fn explicit_utf8_names_are_preserved_and_duplicate_names_require_ids() {
     let fixture = Fixture::empty();
     let name = "试验 / \\ : * ? \" | 💡";
     let named = || {
-        Cli::try_parse_from(["cargo-play", "new", "--name", name])
+        Cli::try_parse_from(["cgpl", "new", "--name", name])
             .unwrap()
             .command
     };
@@ -1072,7 +1072,7 @@ fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
         }
     });
     for position in ["10003", "18446744073709551615"] {
-        let action = Cli::try_parse_from(["cargo-play", "resume", position])
+        let action = Cli::try_parse_from(["cgpl", "resume", position])
             .unwrap()
             .command;
         let error = fixture.run(action, not_opened).unwrap_err();
@@ -1083,7 +1083,7 @@ fn lists_pages_and_resumes_by_full_rank_beyond_first_page() {
         );
         assert_eq!(fixture.active(), current);
     }
-    let action = Cli::try_parse_from(["cargo-play", "resume", "10002"])
+    let action = Cli::try_parse_from(["cgpl", "resume", "10002"])
         .unwrap()
         .command;
     fixture
@@ -1166,7 +1166,7 @@ fn resume_requires_force_to_discard_an_unregistered_workspace() {
             not_opened,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("cargo-play resume --force"));
+    assert!(error.to_string().contains("cgpl resume --force"));
     assert!(fixture.play.join("unregistered.txt").is_file());
 
     fixture
