@@ -7,10 +7,22 @@ use std::{
 
 use clap::Parser;
 use jiff::{Timestamp, tz};
-use serde_json::Value;
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use tempfile::TempDir;
+use uuid::Uuid;
 
-use crate::{Action, Cli, Playground, config::Config, default_package_name, history::History, run};
+use crate::{
+    Action, Cli, Playground, default_package_name, run,
+    state::{NameMatch, PlaygroundRecord, State},
+};
+
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
 
 const MAIN: &str = "fn main() {}\n";
 const MANIFEST: &str = "[package]\nname = \"old-trial\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
@@ -59,6 +71,22 @@ impl Fixture {
         let fixture = Self::empty();
         fixture.run(Action::Init, not_opened).unwrap();
         fixture.write_trial();
+        block_on(async {
+            let state = State::open(&fixture.home).await.unwrap();
+            let id = Uuid::new_v4();
+            state
+                .stage_switch(id, "old-trial", None)
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            fs::write(
+                fixture.play.join(".git/cargo-play.bundle-worktree"),
+                format!("{id}\n"),
+            )
+            .unwrap();
+        });
         fixture
     }
 
@@ -100,22 +128,57 @@ impl Fixture {
     }
 
     fn playground(&self) -> Playground {
-        Playground::open(
+        block_on(Playground::open(
             Some(self.home.clone().into_os_string()),
             true,
-            prepare_config,
-        )
+        ))
         .unwrap()
     }
 
-    fn index(&self) -> Value {
-        serde_json::from_slice(&fs::read(self.home.join("history-meta.json")).unwrap()).unwrap()
+    fn active(&self) -> PlaygroundRecord {
+        block_on(async {
+            State::open(&self.home)
+                .await
+                .unwrap()
+                .active()
+                .await
+                .unwrap()
+                .unwrap()
+        })
+    }
+
+    fn record(&self, id: Uuid) -> PlaygroundRecord {
+        block_on(async {
+            State::open(&self.home)
+                .await
+                .unwrap()
+                .by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+        })
+    }
+
+    fn lookup(&self, name: &str) -> NameMatch {
+        block_on(async {
+            State::open(&self.home)
+                .await
+                .unwrap()
+                .find_by_name(name)
+                .await
+                .unwrap()
+        })
     }
 
     fn archive_at(&self, name: &str) -> PathBuf {
-        self.home
-            .join("history")
-            .join(self.index()[name]["file"].as_str().unwrap())
+        let NameMatch::Unique(id) = self.lookup(name) else {
+            panic!("expected one match for {name:?}");
+        };
+        self.home.join(self.record(id).archived_path.unwrap())
+    }
+
+    fn assert_no_archives(&self) {
+        assert_eq!(fs::read_dir(self.home.join("history")).unwrap().count(), 0);
     }
 
     fn run(
@@ -124,12 +187,11 @@ impl Fixture {
         open: impl FnOnce(&Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         self.with_git(|| {
-            run(
+            block_on(run(
                 action,
                 Some(self.home.clone().into_os_string()),
-                prepare_config,
-                open,
-            )
+                async |path| open(path),
+            ))
         })
     }
 
@@ -190,13 +252,10 @@ pub(super) fn configure_git(command: &mut Command) {
     });
 }
 
-fn prepare_config(home: &Path, create: bool) -> anyhow::Result<()> {
-    Config::read(home)?.prepare(home, create)
-}
-
 fn new(deps: &[&str]) -> Action {
     Action::New {
         deps: deps.iter().map(|dep| (*dep).into()).collect(),
+        name: None,
         force: false,
     }
 }
@@ -213,11 +272,13 @@ fn parses_cli() {
     assert!(Cli::try_parse_from(["cargo-play", "backup", "-d", "serde"]).is_err());
     let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde@1", "anyhow"]).unwrap();
     assert!(
-        matches!(cli.command, Action::New { deps, force: false } if deps == ["serde@1", "anyhow"])
+        matches!(cli.command, Action::New { deps, name: None, force: false } if deps == ["serde@1", "anyhow"])
     );
     for flag in ["-f", "--force"] {
         let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde", flag]).unwrap();
-        assert!(matches!(cli.command, Action::New { deps, force: true } if deps == ["serde"]));
+        assert!(
+            matches!(cli.command, Action::New { deps, name: None, force: true } if deps == ["serde"])
+        );
     }
 }
 
@@ -259,10 +320,12 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     fixture.run(Action::Init, not_opened).unwrap();
     fixture.run(Action::Init, not_opened).unwrap();
     assert!(fixture.home.join("history").is_dir());
-    assert_eq!(fixture.index(), serde_json::json!({}));
+    fixture.assert_no_archives();
     assert!(!fixture.play.join("Cargo.toml").exists());
     fs::create_dir(fixture.home.join("target")).unwrap();
     fs::write(fixture.home.join("target/cache"), "keep").unwrap();
+    fs::create_dir(fixture.play.join("target")).unwrap();
+    fs::write(fixture.play.join("target/cache"), "disposable").unwrap();
     fixture
         .run(new(&[]), |path| {
             assert_eq!(path, fixture.play);
@@ -278,7 +341,7 @@ fn init_and_first_new_create_history_and_clear_only_play() {
     assert!(fixture.home.join("target/cache").exists());
     assert!(!fixture.play.join("target").exists());
     assert!(!fixture.play.join("cargo-play.json").exists());
-    assert_eq!(fixture.index(), serde_json::json!({}));
+    fixture.assert_no_archives();
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
 }
 
@@ -290,15 +353,14 @@ fn new_from_play_directory_preserves_play() {
         let play = std::env::current_dir().unwrap();
         let home = play.parent().unwrap();
         TEST_GIT_CONFIG.set(Some(home.join("test-gitconfig")));
-        run(
+        block_on(run(
             new(&[]),
             Some(home.as_os_str().to_owned()),
-            prepare_config,
-            |folder| {
+            async |folder| {
                 assert_eq!(folder, play);
                 Ok(())
             },
-        )
+        ))
         .unwrap();
         assert_eq!(std::env::current_dir().unwrap(), play);
         assert!(Path::new("src/main.rs").is_file());
@@ -337,30 +399,25 @@ fn nonempty_play_without_manifest_requires_force_even_without_git() {
     fs::write(&cache, "preserve until forced").unwrap();
 
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
-    assert!(format!("{error:#}").contains("Cargo.toml"));
+    assert!(error.to_string().contains("未登记"));
     assert!(error.to_string().contains("--force"));
-    assert_eq!(
-        error
-            .downcast_ref::<std::io::Error>()
-            .map(std::io::Error::kind),
-        Some(std::io::ErrorKind::NotFound)
-    );
     assert!(cache.is_file());
 
     let cli = Cli::try_parse_from(["cargo-play", "new", "-f"]).unwrap();
     fixture.run(cli.command, |_| Ok(())).unwrap();
     assert!(!cache.exists());
     assert!(fixture.play.join("Cargo.toml").is_file());
-    assert_eq!(fixture.index(), serde_json::json!({}));
+    fixture.assert_no_archives();
 }
 
 #[test]
-fn invalid_manifest_can_be_discarded_only_after_new_project_is_ready() {
+fn invalid_manifest_is_archived_using_the_stored_name() {
     let fixture = Fixture::previous_trial();
     fixture.vendor();
     fs::write(fixture.play.join("Cargo.toml"), "invalid toml").unwrap();
     let force = |deps: &[&str]| Action::New {
         deps: deps.iter().map(|dep| (*dep).into()).collect(),
+        name: None,
         force: true,
     };
 
@@ -374,19 +431,20 @@ fn invalid_manifest_can_be_discarded_only_after_new_project_is_ready() {
         "invalid toml"
     );
 
-    fixture.run(force(&[]), |_| Ok(())).unwrap();
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
     assert!(!fixture.play.join("old.txt").exists());
-    assert_eq!(fixture.index(), serde_json::json!({}));
+    assert!(fixture.archive_at("old-trial").is_file());
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
 }
 
 #[test]
-fn force_still_archives_a_project_with_a_valid_package_name() {
+fn force_still_archives_a_registered_project() {
     let fixture = Fixture::previous_trial();
     fixture
         .run(
             Action::New {
                 deps: vec![],
+                name: None,
                 force: true,
             },
             |_| Ok(()),
@@ -396,19 +454,17 @@ fn force_still_archives_a_project_with_a_valid_package_name() {
 }
 
 #[test]
-fn first_new_discards_legacy_projects_and_other_branches() {
+fn first_new_requires_force_to_discard_legacy_projects() {
     let fixture = Fixture::repository();
     fixture.write_trial();
     fixture.git(&["branch", "play/new-20260101-000000"]);
     fixture.run(Action::Init, not_opened).unwrap();
-    fixture.run(new(&[]), |_| Ok(())).unwrap();
-    assert_eq!(fixture.index(), serde_json::json!({}));
-    assert!(
-        fs::read_dir(fixture.home.join("history"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    let error = fixture.run(new(&[]), not_opened).unwrap_err();
+    assert!(error.to_string().contains("--force"));
+    assert!(fixture.play.join("old.txt").is_file());
+    let cli = Cli::try_parse_from(["cargo-play", "new", "--force"]).unwrap();
+    fixture.run(cli.command, |_| Ok(())).unwrap();
+    fixture.assert_no_archives();
     assert!(!fixture.play.join("old.txt").exists());
     assert_eq!(
         fixture.git(&["for-each-ref", "--format=%(refname)", "refs/heads"]),
@@ -424,10 +480,11 @@ fn package_name_uses_local_time() {
 }
 
 #[test]
-fn new_archives_git_history_and_recreates_the_worktree() {
+fn new_archives_git_history_and_keeps_the_registered_name() {
     let fixture = Fixture::previous_trial();
     let previous = fixture.git(&["rev-parse", "HEAD"]);
-    // Use a TOML quoted key and literal string to exercise actual TOML parsing.
+    let id = fixture.active().id;
+    // Changing the Cargo package name must not change the stored playground name.
     fs::write(
         fixture.play.join("Cargo.toml"),
         MANIFEST.replace("name = \"old-trial\"", "'name' = 'renamed-trial' # comment"),
@@ -441,14 +498,16 @@ fn new_archives_git_history_and_recreates_the_worktree() {
     fs::write(fixture.play.join("target/cache"), "discard").unwrap();
     fixture.run(new(&[]), |_| Ok(())).unwrap();
 
-    let entry = &fixture.index()["renamed-trial"];
-    assert_eq!(entry["file"], "renamed-trial.bundle");
-    let timestamp = entry["archived_at"].as_str().unwrap();
+    assert_eq!(fixture.lookup("renamed-trial"), NameMatch::Missing);
+    assert_eq!(fixture.lookup("old-trial"), NameMatch::Unique(id));
+    let entry = fixture.record(id);
+    assert_eq!(entry.archived_path.unwrap(), format!("history/{id}.bundle"));
+    let timestamp = entry.archived_at.as_deref().unwrap();
     assert_eq!(
         timestamp.parse::<Timestamp>().unwrap().to_string(),
         timestamp
     );
-    let bundle = fixture.archive_at("renamed-trial");
+    let bundle = fixture.archive_at("old-trial");
     fixture.git_at(
         &fixture.home,
         &["clone", bundle.to_str().unwrap(), "restored"],
@@ -485,12 +544,14 @@ fn consecutive_new_uses_unique_package_names() {
     fixture.with_git(|| {
         let playground = fixture.playground();
         for expected in ["same-second", "same-second-2", "same-second-3"] {
-            playground.new_project("same-second", &[], false).unwrap();
+            block_on(playground.new_project("same-second", None, &[], false)).unwrap();
             let manifest = fs::read_to_string(fixture.play.join("Cargo.toml")).unwrap();
-            assert_eq!(
-                toml::from_str::<toml::Value>(&manifest).unwrap()["package"]["name"].as_str(),
-                Some(expected)
+            assert!(
+                manifest
+                    .lines()
+                    .any(|line| line == format!("name = \"{expected}\""))
             );
+            assert_eq!(fixture.active().name, expected);
         }
     });
     assert!(fixture.archive_at("same-second").is_file());
@@ -498,16 +559,35 @@ fn consecutive_new_uses_unique_package_names() {
 }
 
 #[test]
-fn same_package_name_preserves_existing_bundle_and_updates_index() {
-    let fixture = Fixture::previous_trial();
-    fixture.run(new(&[]), |_| Ok(())).unwrap();
-    let first = fixture.archive_at("old-trial");
-    let bytes = fs::read(&first).unwrap();
+fn explicit_utf8_names_are_preserved_and_duplicate_names_require_ids() {
+    let fixture = Fixture::empty();
+    let name = "试验 / \\ : * ? \" | 💡";
+    let named = || {
+        Cli::try_parse_from(["cargo-play", "new", "--name", name])
+            .unwrap()
+            .command
+    };
+    fixture.run(named(), |_| Ok(())).unwrap();
+    let first = fixture.active();
+    assert_eq!(first.id.get_version_num(), 4);
+    assert_eq!(first.name, name);
+    assert!(first.archived_at.is_none());
+    assert!(first.archived_path.is_none());
+    assert_eq!(fixture.lookup(name), NameMatch::Unique(first.id));
+    assert_eq!(fixture.lookup(&format!("{name} ")), NameMatch::Missing);
     fs::write(fixture.play.join("Cargo.toml"), MANIFEST).unwrap();
+    fixture.run(named(), |_| Ok(())).unwrap();
+    let second = fixture.active();
+    assert_ne!(first.id, second.id);
+    assert_eq!(fixture.lookup(name), NameMatch::Ambiguous);
+    assert_eq!(fixture.record(first.id).name, name);
+    assert_eq!(fixture.lookup("old-trial"), NameMatch::Missing);
     fixture.run(new(&[]), |_| Ok(())).unwrap();
-    assert_eq!(fs::read(&first).unwrap(), bytes);
-    assert_eq!(fixture.index()["old-trial"]["file"], "old-trial-2.bundle");
-    assert!(fixture.archive_at("old-trial").is_file());
+    for id in [first.id, second.id] {
+        let path = fixture.record(id).archived_path.unwrap();
+        assert_eq!(path, format!("history/{id}.bundle"));
+        assert!(fixture.home.join(path).is_file());
+    }
 }
 
 #[test]
@@ -530,67 +610,106 @@ fn backup_and_new_reject_tracked_target() {
 }
 
 #[test]
-fn invalid_manifest_and_index_preserve_the_worktree() {
+fn invalid_database_preserves_the_worktree() {
     let fixture = Fixture::previous_trial();
     let head = fixture.git(&["rev-parse", "HEAD"]);
-    fs::write(
-        fixture.play.join("Cargo.toml"),
-        "[package]\nname = '../unsafe'",
-    )
-    .unwrap();
-    assert!(
-        fixture
-            .run(new(&[]), not_opened)
-            .unwrap_err()
-            .chain()
-            .any(|cause| cause.to_string().contains("归档文件名"))
-    );
-    fs::write(fixture.play.join("Cargo.toml"), "invalid toml").unwrap();
-    assert!(
-        fixture
-            .run(new(&[]), not_opened)
-            .unwrap_err()
-            .chain()
-            .any(|cause| cause.to_string().contains("[package].name"))
-    );
-    fs::write(
-        fixture.play.join("Cargo.toml"),
-        "[package]\nversion = '0.1.0'",
-    )
-    .unwrap();
+    fs::write(fixture.home.join("workspace.sqlite3"), "invalid database").unwrap();
     let error = fixture.run(new(&[]), not_opened).unwrap_err();
-    assert!(
-        format!("{error:#}").contains("[package].name") && error.to_string().contains("--force")
-    );
-    fs::write(fixture.play.join("Cargo.toml"), MANIFEST).unwrap();
-    fs::write(fixture.home.join("history-meta.json"), "[]").unwrap();
-    assert!(
-        fixture
-            .run(new(&[]), not_opened)
-            .unwrap_err()
-            .to_string()
-            .contains("history-meta.json")
-    );
+    assert!(format!("{error:#}").contains("workspace.sqlite3"));
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
     assert!(fixture.play.join("old.txt").is_file());
 }
 
 #[test]
-fn index_write_failure_removes_only_the_unpublished_archive() {
+fn blocked_archive_publication_restores_the_original_worktree() {
     let fixture = Fixture::previous_trial();
-    let mut history = History::open(&fixture.home).unwrap();
-    let index = fixture.home.join("history-meta.json");
-    fs::rename(&index, index.with_extension("original")).unwrap();
-    fs::create_dir(&index).unwrap();
-    let error = history
-        .archive("old-trial", |path| {
-            fs::write(path, "test archive")?;
-            Ok(())
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("写入"), "{error}");
-    assert!(!fixture.home.join("history/old-trial.bundle").exists());
+    let record = fixture.active();
+    let destination = fixture.home.join(format!("history/{}.bundle", record.id));
+    fs::create_dir(&destination).unwrap();
+    let error = fixture.run(new(&[]), not_opened).unwrap_err();
+    assert!(format!("{error:#}").contains("归档路径"));
+    assert!(destination.is_dir());
+    assert_eq!(fixture.active(), record);
     assert!(fixture.play.join("old.txt").is_file());
+}
+
+#[test]
+fn rearchiving_the_same_uuid_overwrites_one_bundle_and_rolls_back_on_commit_failure() {
+    let fixture = Fixture::previous_trial();
+    let id = fixture.active().id;
+    let bundle = fixture.home.join(format!("history/{id}.bundle"));
+    // Simulate an active playground that already has an archive, as after a future restore.
+    fixture.git(&[
+        "bundle",
+        "create",
+        bundle.to_str().unwrap(),
+        "HEAD",
+        "refs/heads/archive",
+    ]);
+    let bytes = fs::read(&bundle).unwrap();
+    block_on(async {
+        let state = State::open(&fixture.home).await.unwrap();
+        state
+            .connection()
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE playgrounds SET archived_path = ?, archived_at = ? WHERE id = ?",
+                [
+                    format!("history/{id}.bundle").into(),
+                    "2026-01-01T00:00:00Z".into(),
+                    id.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE commit_failure (id INTEGER REFERENCES current_playground(slot) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TRIGGER reject_commit AFTER INSERT ON playgrounds BEGIN INSERT INTO commit_failure VALUES (2); END",
+        ] {
+            state
+                .connection()
+                .execute_unprepared(statement)
+                .await
+                .unwrap();
+        }
+    });
+    let record = fixture.active();
+    fs::write(fixture.play.join("updated.txt"), "new contents").unwrap();
+    let error = fixture.run(new(&[]), not_opened).unwrap_err();
+    assert!(format!("{error:#}").contains("提交工作区状态失败"));
+    assert_eq!(fixture.active(), record);
+    assert_eq!(fs::read(&bundle).unwrap(), bytes);
+    assert!(fixture.play.join("updated.txt").is_file());
+    assert_eq!(
+        fs::read_dir(fixture.home.join("history")).unwrap().count(),
+        1
+    );
+
+    block_on(async {
+        let state = State::open(&fixture.home).await.unwrap();
+        state
+            .connection()
+            .execute_unprepared("DROP TRIGGER reject_commit")
+            .await
+            .unwrap();
+    });
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    let updated = fixture.record(id);
+    assert_eq!(updated.archived_path, record.archived_path);
+    assert_ne!(updated.archived_at, record.archived_at);
+    assert_ne!(fs::read(&bundle).unwrap(), bytes);
+    assert_eq!(
+        fs::read_dir(fixture.home.join("history")).unwrap().count(),
+        1
+    );
+    fixture.git_at(
+        &fixture.home,
+        &["clone", bundle.to_str().unwrap(), "restored"],
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.home.join("restored/updated.txt")).unwrap(),
+        "new contents"
+    );
 }
 
 #[test]
@@ -670,7 +789,7 @@ fn failed_backup_preserves_staged_work() {
             .contains("备份失败")
     );
     assert_eq!(fixture.git(&["status", "--porcelain"]), "A  draft.txt");
-    assert_eq!(fixture.index(), serde_json::json!({}));
+    fixture.assert_no_archives();
 }
 
 #[test]
@@ -686,7 +805,7 @@ fn bundle_failure_preserves_the_current_project() {
             .contains("浅克隆")
     );
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
-    assert_eq!(fixture.index(), serde_json::json!({}));
+    fixture.assert_no_archives();
     assert!(fixture.play.join("old.txt").is_file());
 }
 
@@ -701,7 +820,7 @@ fn cargo_failure_preserves_original_project_before_backup() {
     assert!(error.to_string().contains("cargo add 失败"), "{error}");
     assert_eq!(fixture.git(&["log", "--format=%s"]), "old trial");
     assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
-    assert_eq!(fixture.index(), serde_json::json!({}));
+    fixture.assert_no_archives();
 }
 
 #[test]

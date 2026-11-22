@@ -1,21 +1,17 @@
 use std::{
-    env,
     ffi::OsString,
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    io,
     path::{self, Path, PathBuf},
-    sync::LazyLock,
 };
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use tokio::{
+    fs::{self, OpenOptions},
+    io::AsyncWriteExt,
+};
 
 const CONFIG_FILE: &str = "cargo-play.json";
-
-pub static CONFIG: LazyLock<Result<Config>> = LazyLock::new(|| {
-    let home = resolve_home(env::var_os("CARGOPLAY_HOME"))?;
-    Config::read(&home)
-});
 
 pub fn resolve_home(home: Option<OsString>) -> Result<PathBuf> {
     let home = home
@@ -24,21 +20,17 @@ pub fn resolve_home(home: Option<OsString>) -> Result<PathBuf> {
     path::absolute(home).context("解析 CARGOPLAY_HOME 失败")
 }
 
-pub fn prepare_global(home: &Path, create: bool) -> Result<()> {
-    let config = LazyLock::force(&CONFIG).as_ref().map_err(|error| {
-        let source: &(dyn std::error::Error + Send + Sync) = error.as_ref();
-        anyhow::Error::new(source)
-    })?;
-    config.prepare(home, create)
+pub async fn prepare_config(home: &Path, create: bool) -> Result<()> {
+    Config::read(home).await?.prepare(home, create).await
 }
 
 #[derive(Default, Deserialize, Serialize)]
 pub struct Config {}
 
 impl Config {
-    pub fn read(home: &Path) -> Result<Self> {
+    async fn read(home: &Path) -> Result<Self> {
         let path = home.join(CONFIG_FILE);
-        let data = match fs::read(&path) {
+        let data = match fs::read(&path).await {
             Ok(data) => data,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => {
@@ -54,21 +46,30 @@ impl Config {
         serde_json::from_slice(data).with_context(|| format!("{CONFIG_FILE} 必须是 JSON 对象"))
     }
 
-    pub fn prepare(&self, home: &Path, create: bool) -> Result<()> {
+    async fn prepare(&self, home: &Path, create: bool) -> Result<()> {
         if !create {
             return Ok(());
         }
         let path = home.join(CONFIG_FILE);
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
             Err(error) => {
                 return Err(error).with_context(|| format!("创建 {} 失败", path.display()));
             }
         };
-        serde_json::to_writer_pretty(&mut file, self)
+        let mut data = serde_json::to_vec_pretty(self)?;
+        data.push(b'\n');
+        file.write_all(&data)
+            .await
             .with_context(|| format!("写入 {} 失败", path.display()))?;
-        file.write_all(b"\n")
+        file.flush()
+            .await
             .with_context(|| format!("写入 {} 失败", path.display()))
     }
 }

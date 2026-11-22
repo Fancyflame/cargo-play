@@ -6,7 +6,14 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-pub fn open_folder(folder: &Path) -> Result<()> {
+pub async fn open_folder(folder: &Path) -> Result<()> {
+    let folder = folder.to_owned();
+    tokio::task::spawn_blocking(move || open_folder_blocking(&folder))
+        .await
+        .context("等待编辑器启动失败")?
+}
+
+fn open_folder_blocking(folder: &Path) -> Result<()> {
     if let Some(code) = find_code() {
         match Command::new(code)
             .env_remove("ELECTRON_RUN_AS_NODE")
