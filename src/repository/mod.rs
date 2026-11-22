@@ -1,4 +1,4 @@
-//! 游乐场仓库的入口，负责打开和初始化仓库，以及新建、清场和恢复游乐场。
+//! 演练场仓库的入口，负责打开和初始化仓库，以及新建、清场和恢复演练场。
 
 mod deletion;
 mod filesystem;
@@ -133,7 +133,7 @@ impl Playground {
         }
         self.replace_worktree(&state, staging, true, None, Some((id, display_name)))
             .await?;
-        println!("已创建试验 {display_name:?} ({id})");
+        println!("已创建演练场 {display_name:?} ({id})");
         if !deps.is_empty() {
             println!("已提交依赖 {}", deps.join(", "));
         }
@@ -159,7 +159,7 @@ impl Playground {
         }
         let bundle = target
             .archived_path
-            .with_context(|| format!("游乐场 {id} 没有归档"))?;
+            .with_context(|| format!("演练场 {id} 没有归档"))?;
         self.archive_and_clear(&state, current.as_ref(), force, &format!("open {id}"))
             .await?;
 
@@ -170,7 +170,7 @@ impl Playground {
         let result = async {
             restore_bundle(&self.home, &bundle, &next)
                 .await
-                .with_context(|| format!("从 Bundle 恢复游乐场 {id} 失败"))?;
+                .with_context(|| format!("从 Bundle 恢复演练场 {id} 失败"))?;
             write_new(&marker_path(&next), format!("{id}\n").as_bytes())
                 .await
                 .context("写入恢复工作区 UUID 失败")?;
@@ -181,7 +181,7 @@ impl Playground {
         }
         .await;
         changes.finish(staging, result).await?;
-        println!("已恢复试验 {:?} ({id})", target.name);
+        println!("已恢复演练场 {:?} ({id})", target.name);
         Ok(())
     }
 
@@ -210,14 +210,14 @@ impl Playground {
             PlaygroundTarget::Id(id) => id,
             PlaygroundTarget::Position(position) => {
                 state.id_at_position(position).await?.with_context(|| {
-                    format!("找不到序号为 {position} 的游乐场，请运行 cgpl list 查看。")
+                    format!("找不到序号为 {position} 的演练场，请运行 cgpl list 查看。")
                 })?
             }
         };
         state
             .by_id(id)
             .await?
-            .with_context(|| format!("找不到游乐场 {id}"))
+            .with_context(|| format!("找不到演练场 {id}"))
     }
 
     async fn prepare_history(&self) -> Result<()> {
@@ -234,15 +234,15 @@ impl Playground {
         let git_dir = self.root.join(".git");
         ensure!(
             directory_exists(&self.root).await? && directory_exists(&git_dir).await?,
-            "当前游乐场 {id} 的 Git 工作区不存在。"
+            "当前演练场 {id} 的 Git 工作区不存在。"
         );
         let path = marker_path(&self.root);
         let marker = fs::read_to_string(&path)
             .await
-            .with_context(|| format!("读取当前游乐场 UUID（{}）失败", path.display()))?;
+            .with_context(|| format!("读取当前演练场 UUID（{}）失败", path.display()))?;
         ensure!(
             marker.trim().parse::<Uuid>().ok() == Some(id),
-            "工作区的 UUID 与数据库中当前游乐场 {id} 不一致。"
+            "工作区的 UUID 与数据库中当前演练场 {id} 不一致。"
         );
         Ok(())
     }
@@ -267,8 +267,8 @@ fn lock_home(path: &Path) -> Result<File> {
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => {
-            bail!("试验仓库正在使用，请等另一条 cgpl 命令结束后重试。")
+            bail!("演练场仓库正在使用，请等另一条 cgpl 命令结束后重试。")
         }
-        Err(TryLockError::Error(error)) => Err(error).context("锁定试验仓库失败"),
+        Err(TryLockError::Error(error)) => Err(error).context("锁定演练场仓库失败"),
     }
 }

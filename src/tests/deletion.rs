@@ -163,7 +163,7 @@ fn deletes_the_current_playground_and_its_old_bundle_without_a_target() {
             not_opened,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("没有当前游乐场"));
+    assert!(error.to_string().contains("没有当前演练场"));
     fixture
         .run(
             Action::Open {
@@ -278,7 +278,7 @@ fn restores_files_and_database_state_if_delete_commit_fails() {
     let error = fixture
         .run(delete_by_id(record.id), not_opened)
         .unwrap_err();
-    assert!(error.to_string().contains("提交游乐场删除事务失败"));
+    assert!(error.to_string().contains("提交演练场删除事务失败"));
     assert_eq!(fixture.active(), record);
     assert_eq!(fs::read(bundle).unwrap(), bytes);
     assert_eq!(

@@ -1,4 +1,4 @@
-//! 删除当前或已归档的游乐场，协调确认、文件暂存和数据库记录清理。
+//! 删除当前或已归档的演练场，协调确认、文件暂存和数据库记录清理。
 
 use super::{
     Playground, PlaygroundTarget, archive_path,
@@ -30,7 +30,7 @@ impl Playground {
                 (record, is_current)
             }
             None => (
-                current.context("没有当前游乐场，请运行 cgpl list 查看。")?,
+                current.context("没有当前演练场，请运行 cgpl list 查看。")?,
                 true,
             ),
         };
@@ -76,7 +76,7 @@ impl Playground {
                 let last_visit = record
                     .last_visit_time
                     .parse::<Timestamp>()
-                    .with_context(|| format!("游乐场 {} 的上次访问时间无效", record.id))?;
+                    .with_context(|| format!("演练场 {} 的上次访问时间无效", record.id))?;
                 archived_at.duration_since(last_visit).as_secs_f64() / 3600.0 > max_hours
             } else {
                 false
@@ -121,11 +121,11 @@ impl Playground {
                     .switch_worktree(&self.root, staging.path(), &empty, true, rename_entry)
                     .await?;
             }
-            txn.commit().await.context("提交游乐场删除事务失败")
+            txn.commit().await.context("提交演练场删除事务失败")
         }
         .await;
         changes.finish(staging, result).await?;
-        println!("已删除游乐场 {:?} ({})", record.name, record.id);
+        println!("已删除演练场 {:?} ({})", record.name, record.id);
         Ok(())
     }
 
@@ -136,7 +136,7 @@ impl Playground {
         let expected = archive_path(record.id);
         ensure!(
             *stored == expected,
-            "游乐场 {} 的归档路径不匹配：{stored:?}",
+            "演练场 {} 的归档路径不匹配：{stored:?}",
             record.id
         );
         if !directory_exists(&self.home.join("history")).await? {

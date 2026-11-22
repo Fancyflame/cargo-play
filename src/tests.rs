@@ -42,7 +42,7 @@ struct Fixture {
 impl Fixture {
     fn empty() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("Rust 试验场");
+        let home = dir.path().join("Rust 演练场");
         let play = home.join("play");
         fs::create_dir_all(&home).unwrap();
         fs::write(
@@ -378,7 +378,7 @@ fn lists_all_playgrounds_by_visit_time_and_uuid() {
             ),
             (
                 oldest,
-                "旧试验",
+                "旧演练场",
                 "2025-02-01T18:04:05Z",
                 Some("history/one.bundle"),
             ),
@@ -461,7 +461,7 @@ fn lists_all_playgrounds_by_visit_time_and_uuid() {
             ],
             [
                 "6",
-                "旧试验",
+                "旧演练场",
                 &oldest.to_string(),
                 "2025-02-02 02:04:05 +08:00"
             ],
@@ -547,7 +547,7 @@ fn open_requires_an_existing_folder() {
             not_opened,
         )
         .unwrap_err();
-    assert!(error.to_string().contains("找不到试验文件夹"));
+    assert!(error.to_string().contains("找不到演练场文件夹"));
     assert!(!fixture.play.exists());
 }
 
@@ -870,7 +870,7 @@ fn consecutive_new_uses_unique_package_names() {
 #[test]
 fn explicit_utf8_names_are_preserved_and_duplicate_names_require_ids() {
     let fixture = Fixture::empty();
-    let name = "试验 / \\ : * ? \" | 💡";
+    let name = "演练场 / \\ : * ? \" | 💡";
     let named = || {
         Cli::try_parse_from(["cgpl", "new", "--name", name])
             .unwrap()

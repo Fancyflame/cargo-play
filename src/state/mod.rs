@@ -35,7 +35,7 @@ impl State {
         let record = self
             .by_id(active.playground_id)
             .await?
-            .context("当前游乐场的数据库记录不存在")?;
+            .context("当前演练场的数据库记录不存在")?;
         Ok(Some(record))
     }
 
@@ -108,7 +108,7 @@ impl State {
             Ok::<_, sea_orm::DbErr>(txn)
         }
         .await
-        .context("清除当前游乐场状态失败")
+        .context("清除当前演练场状态失败")
     }
 
     pub async fn stage_delete(&self, id: Uuid) -> Result<DatabaseTransaction> {
@@ -117,12 +117,12 @@ impl State {
             .filter(current::Column::PlaygroundId.eq(id))
             .exec(&txn)
             .await
-            .context("清除当前游乐场状态失败")?;
+            .context("清除当前演练场状态失败")?;
         let result = playground::Entity::delete_by_id(id)
             .exec(&txn)
             .await
-            .with_context(|| format!("删除游乐场 {id} 的记录失败"))?;
-        ensure!(result.rows_affected == 1, "找不到游乐场 {id}");
+            .with_context(|| format!("删除演练场 {id} 的记录失败"))?;
+        ensure!(result.rows_affected == 1, "找不到演练场 {id}");
         Ok(txn)
     }
 
@@ -140,7 +140,7 @@ impl State {
             txn.commit().await
         }
         .await
-        .with_context(|| format!("记录游乐场 {id} 的访问失败"))
+        .with_context(|| format!("记录演练场 {id} 的访问失败"))
     }
 
     async fn set_current(db: &impl ConnectionTrait, id: Uuid) -> Result<(), sea_orm::DbErr> {

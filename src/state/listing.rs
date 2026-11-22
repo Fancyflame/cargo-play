@@ -44,13 +44,13 @@ impl State {
         ))
         .all(&db)
         .await
-        .context("读取游乐场列表失败")?;
+        .context("读取演练场列表失败")?;
         rows.into_iter()
             .map(|row| {
                 let last_visit_time = row
                     .last_visit_time
                     .parse::<Timestamp>()
-                    .with_context(|| format!("游乐场 {} 的上次访问时间无效", row.id))?;
+                    .with_context(|| format!("演练场 {} 的上次访问时间无效", row.id))?;
                 Ok(PlaygroundListEntry {
                     id: row.id,
                     name: row.name,
@@ -88,6 +88,6 @@ impl State {
             ))
             .await
             .and_then(|row| row.map(|row| row.try_get("", "id")).transpose())
-            .with_context(|| format!("查询游乐场序号 {position} 失败"))
+            .with_context(|| format!("查询演练场序号 {position} 失败"))
     }
 }
