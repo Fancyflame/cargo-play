@@ -19,7 +19,7 @@ struct Cli {
 enum Action {
     /// 初始化 CARGOPLAY_HOME 下的配置和 play 仓库
     Init,
-    /// 备份上一次试验，用 cargo init 创建新试验并打开 src/main.rs
+    /// 备份上一次试验，用 cargo init 创建新试验并打开项目文件夹
     New {
         /// 依赖列表，支持 crate 名和 crate@版本
         #[arg(short = 'd', long, value_name = "依赖", num_args = 1..)]
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
         matches!(&cli.command, Action::Init | Action::New { .. }),
         config::prepare_global,
     )
-    .and_then(|repo| run(cli.command, repo, editor::open));
+    .and_then(|repo| run(cli.command, repo, editor::open_folder));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -79,10 +79,10 @@ fn run(action: Action, repo: Repository, open: impl FnOnce(&Path) -> Result<()>)
                 println!("已提交依赖 {}", deps.join(", "));
             }
 
-            let main = repo.root.join("src").join("main.rs");
+            let folder = repo.root.clone();
             drop(repo);
-            if let Err(error) = open(&main) {
-                eprintln!("警告：{error}\n请手动打开 {}", main.display());
+            if let Err(error) = open(&folder) {
+                eprintln!("警告：{error}\n请手动打开 {}", folder.display());
             }
         }
     }

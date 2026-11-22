@@ -180,8 +180,13 @@ fn first_use_creates_nested_repository_and_config_and_preserves_targets() {
     fixture.git(&["config", "commit.gpgsign", "false"]);
     fixture
         .run(new(&[]), |path| {
-            assert_eq!(path, fixture.play.join("src/main.rs"));
-            assert!(fs::read_to_string(path).unwrap().contains("Hello, world!"));
+            assert_eq!(path, fixture.play);
+            assert!(path.join("Cargo.toml").is_file());
+            assert!(
+                fs::read_to_string(path.join("src/main.rs"))
+                    .unwrap()
+                    .contains("Hello, world!")
+            );
             Ok(())
         })
         .unwrap();
@@ -224,7 +229,12 @@ fn backs_up_old_project_then_initializes_fresh_trial() {
 
     fixture
         .run(new(&[]), |path| {
-            assert!(fs::read_to_string(path).unwrap().contains("Hello, world!"));
+            assert!(path.join("Cargo.toml").is_file());
+            assert!(
+                fs::read_to_string(path.join("src/main.rs"))
+                    .unwrap()
+                    .contains("Hello, world!")
+            );
             Ok(())
         })
         .unwrap();
