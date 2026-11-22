@@ -1,15 +1,16 @@
 mod config;
 mod editor;
+mod history;
 mod repository;
 
 use std::{env, ffi::OsString, path::Path, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use jiff::{Timestamp, Zoned};
-use repository::Repository;
+use jiff::Zoned;
+use repository::Playground;
 
 #[derive(Parser)]
-#[command(version, about = "用 Git 分支管理 Rust 试验")]
+#[command(version, about = "用 Git Bundle 归档 Rust 试验")]
 struct Cli {
     #[command(subcommand)]
     command: Action,
@@ -17,13 +18,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// 初始化 CARGOPLAY_HOME 下的配置和 play 仓库
+    /// 初始化 CARGOPLAY_HOME 下的配置、play 和 history
     Init,
-    /// 备份上一次试验，用 cargo init 创建新试验并打开项目文件夹
+    /// 归档上一个试验，用 cargo init 创建新试验并打开项目文件夹
+    ///
+    /// 首次使用新版时会清理旧版工作区。Git 忽略的文件随旧工作区清理。
     New {
         /// 依赖列表，支持 crate 名和 crate@版本
         #[arg(short = 'd', long, value_name = "依赖", num_args = 1..)]
         deps: Vec<String>,
+        /// 无法读取旧项目包名时，跳过归档并强制清空
+        #[arg(short, long)]
+        force: bool,
     },
     /// 打开当前试验文件夹
     Open,
@@ -50,8 +56,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn default_branch_name(now: &Zoned) -> String {
-    now.strftime("play/new-%Y%m%d-%H%M%S").to_string()
+fn default_package_name(now: &Zoned) -> String {
+    now.strftime("play-new-%Y%m%d-%H%M%S").to_string()
 }
 
 fn run(
@@ -60,10 +66,13 @@ fn run(
     prepare_config: impl FnOnce(&Path, bool) -> Result<()>,
     open: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
-    let timestamp = || Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let repo = |home, create| Repository::open(home, create, prepare_config);
+    let playground = |home, create| Playground::open(home, create, prepare_config);
     match action {
-        Action::Init => println!("试验仓库已就绪：{}", repo(home, true)?.root.display()),
+        Action::Init => {
+            let playground = playground(home, true)?;
+            playground.init()?;
+            println!("试验目录已就绪：{}", playground.root.display());
+        }
         Action::Open => {
             let folder = config::resolve_home(home)?.join("play");
             if !folder.is_dir() {
@@ -74,31 +83,12 @@ fn run(
             }
             open_with_warning(&folder, open);
         }
-        Action::Backup => {
-            repo(home, false)?.backup(&timestamp())?;
-        }
-        Action::New { deps } => {
-            let repo = repo(home, true)?;
-            repo.backup(&timestamp())?;
-            if repo.has_changes()? {
-                return Err("备份后工作区仍有改动，请运行 git status 检查后重试。".into());
-            }
-            let branch = repo.new_branch(&default_branch_name(&Zoned::now()))?;
-            let recover = |error| {
-                format!(
-                    "{error}\n当前仍在 {branch}。请在 {} 中运行 git status 检查现场，修复后可运行 cargo-play backup 保存改动。",
-                    repo.root.display()
-                )
-            };
-            repo.init_project().map_err(recover)?;
-            println!("已创建试验分支 {branch}");
-            if !deps.is_empty() {
-                repo.add_dependencies(&deps).map_err(recover)?;
-                println!("已提交依赖 {}", deps.join(", "));
-            }
-
-            let folder = repo.root.clone();
-            drop(repo);
+        Action::Backup => playground(home, false)?.backup()?,
+        Action::New { deps, force } => {
+            let playground = playground(home, true)?;
+            playground.new_project(&default_package_name(&Zoned::now()), &deps, force)?;
+            let folder = playground.root.clone();
+            drop(playground);
             open_with_warning(&folder, open);
         }
     }

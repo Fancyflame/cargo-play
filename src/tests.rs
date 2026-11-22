@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString,
+    cell::RefCell,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -7,9 +7,10 @@ use std::{
 
 use clap::Parser;
 use jiff::{Timestamp, tz};
+use serde_json::Value;
 use tempfile::TempDir;
 
-use crate::{Action, Cli, Repository, config::Config, default_branch_name, run};
+use crate::{Action, Cli, Playground, config::Config, default_package_name, history::History, run};
 
 const MAIN: &str = "fn main() {}\n";
 const MANIFEST: &str = "[package]\nname = \"old-trial\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
@@ -26,6 +27,11 @@ impl Fixture {
         let home = dir.path().join("Rust 试验场");
         let play = home.join("play");
         fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("test-gitconfig"),
+            "[user]\nname = Cargo Play Test\nemail = test@example.com\n[commit]\ngpgsign = false\n",
+        )
+        .unwrap();
         Self {
             _dir: dir,
             home,
@@ -50,26 +56,34 @@ impl Fixture {
     }
 
     fn previous_trial() -> Self {
-        let fixture = Self::repository();
-        fs::create_dir(fixture.play.join("src")).unwrap();
-        fs::write(fixture.play.join("Cargo.toml"), MANIFEST).unwrap();
-        fs::write(fixture.play.join("src/main.rs"), MAIN).unwrap();
-        fs::write(fixture.play.join("old.txt"), "old").unwrap();
-        fixture.git(&["add", "-A"]);
-        fixture.git(&["commit", "-m", "old trial"]);
+        let fixture = Self::empty();
+        fixture.run(Action::Init, not_opened).unwrap();
+        fixture.write_trial();
         fixture
     }
 
+    fn write_trial(&self) {
+        fs::create_dir(self.play.join("src")).unwrap();
+        fs::write(self.play.join("Cargo.toml"), MANIFEST).unwrap();
+        fs::write(self.play.join("src/main.rs"), MAIN).unwrap();
+        fs::write(self.play.join("old.txt"), "old").unwrap();
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-m", "old trial"]);
+    }
+
     fn git(&self, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(&self.play)
-            .args(args)
-            .output()
-            .unwrap();
+        self.git_at(&self.play, args)
+    }
+
+    fn git_at(&self, dir: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        let output = self.with_git(|| {
+            configure_git(&mut command);
+            command.current_dir(dir).args(args).output().unwrap()
+        });
         assert!(
             output.status.success(),
-            "git {args:?}\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
+            "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout)
@@ -78,17 +92,45 @@ impl Fixture {
             .to_owned()
     }
 
+    fn with_git<T>(&self, f: impl FnOnce() -> T) -> T {
+        let prior = TEST_GIT_CONFIG.replace(Some(self.home.join("test-gitconfig")));
+        let result = f();
+        TEST_GIT_CONFIG.replace(prior);
+        result
+    }
+
+    fn playground(&self) -> Playground {
+        Playground::open(
+            Some(self.home.clone().into_os_string()),
+            true,
+            prepare_config,
+        )
+        .unwrap()
+    }
+
+    fn index(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.home.join("history-meta.json")).unwrap()).unwrap()
+    }
+
+    fn archive_at(&self, name: &str) -> PathBuf {
+        self.home
+            .join("history")
+            .join(self.index()[name]["file"].as_str().unwrap())
+    }
+
     fn run(
         &self,
         action: Action,
         open: impl FnOnce(&Path) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        run(
-            action,
-            Some(self.home.clone().into_os_string()),
-            prepare_config,
-            open,
-        )
+        self.with_git(|| {
+            run(
+                action,
+                Some(self.home.clone().into_os_string()),
+                prepare_config,
+                open,
+            )
+        })
     }
 
     fn fail_commits(&self) {
@@ -134,8 +176,18 @@ directory = "vendor"
     }
 }
 
-fn open_repo(home: Option<OsString>, create: bool) -> crate::Result<Repository> {
-    Repository::open(home, create, prepare_config)
+thread_local! {
+    static TEST_GIT_CONFIG: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+pub(super) fn configure_git(command: &mut Command) {
+    TEST_GIT_CONFIG.with_borrow(|config| {
+        if let Some(config) = config {
+            command
+                .env("GIT_CONFIG_GLOBAL", config)
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+        }
+    });
 }
 
 fn prepare_config(home: &Path, create: bool) -> crate::Result<()> {
@@ -145,6 +197,7 @@ fn prepare_config(home: &Path, create: bool) -> crate::Result<()> {
 fn new(deps: &[&str]) -> Action {
     Action::New {
         deps: deps.iter().map(|dep| (*dep).into()).collect(),
+        force: false,
     }
 }
 
@@ -159,7 +212,13 @@ fn parses_cli() {
     assert!(Cli::try_parse_from(["cargo-play", "new", "-d"]).is_err());
     assert!(Cli::try_parse_from(["cargo-play", "backup", "-d", "serde"]).is_err());
     let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde@1", "anyhow"]).unwrap();
-    assert!(matches!(cli.command, Action::New { deps } if deps == ["serde@1", "anyhow"]));
+    assert!(
+        matches!(cli.command, Action::New { deps, force: false } if deps == ["serde@1", "anyhow"])
+    );
+    for flag in ["-f", "--force"] {
+        let cli = Cli::try_parse_from(["cargo-play", "new", "-d", "serde", flag]).unwrap();
+        assert!(matches!(cli.command, Action::New { deps, force: true } if deps == ["serde"]));
+    }
 }
 
 #[test]
@@ -188,7 +247,7 @@ fn open_requires_an_existing_folder() {
 }
 
 #[test]
-fn first_use_creates_nested_repository_and_config_and_preserves_targets() {
+fn init_and_first_new_create_history_and_clear_only_play() {
     let fixture = Fixture::empty();
     assert!(
         fixture
@@ -196,22 +255,16 @@ fn first_use_creates_nested_repository_and_config_and_preserves_targets() {
             .unwrap_err()
             .contains("首次使用")
     );
-    for target in [fixture.home.join("target"), fixture.play.join("target")] {
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("keep.txt"), "keep").unwrap();
-    }
-    // Bootstrap separately so the test can set a repository-local Git identity.
     fixture.run(Action::Init, not_opened).unwrap();
     fixture.run(Action::Init, not_opened).unwrap();
-    assert_eq!(fixture.git(&["symbolic-ref", "--short", "HEAD"]), "archive");
+    assert!(fixture.home.join("history").is_dir());
+    assert_eq!(fixture.index(), serde_json::json!({}));
     assert!(!fixture.play.join("Cargo.toml").exists());
-    fixture.git(&["config", "user.name", "Cargo Play Test"]);
-    fixture.git(&["config", "user.email", "test@example.com"]);
-    fixture.git(&["config", "commit.gpgsign", "false"]);
+    fs::create_dir(fixture.home.join("target")).unwrap();
+    fs::write(fixture.home.join("target/cache"), "keep").unwrap();
     fixture
         .run(new(&[]), |path| {
             assert_eq!(path, fixture.play);
-            assert!(path.join("Cargo.toml").is_file());
             assert!(
                 fs::read_to_string(path.join("src/main.rs"))
                     .unwrap()
@@ -221,91 +274,189 @@ fn first_use_creates_nested_repository_and_config_and_preserves_targets() {
         })
         .unwrap();
     assert!(!fixture.home.join(".git").exists());
-    assert!(fixture.play.join(".git").is_dir());
-    assert_eq!(
-        fs::read_to_string(fixture.home.join("cargo-play.json")).unwrap(),
-        "{}\n"
-    );
+    assert!(fixture.home.join("target/cache").exists());
+    assert!(!fixture.play.join("target").exists());
     assert!(!fixture.play.join("cargo-play.json").exists());
-    for target in [fixture.home.join("target"), fixture.play.join("target")] {
-        assert_eq!(fs::read_to_string(target.join("keep.txt")).unwrap(), "keep");
-    }
+    assert_eq!(fixture.index(), serde_json::json!({}));
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
-    assert!(fixture.git(&["ls-files", "--", "target"]).is_empty());
 }
 
 #[test]
-fn branch_name_uses_local_time() {
+fn nonempty_play_without_manifest_requires_force_even_without_git() {
+    let fixture = Fixture::empty();
+    fs::create_dir_all(fixture.play.join("target")).unwrap();
+    let cache = fixture.play.join("target/cache");
+    fs::write(&cache, "preserve until forced").unwrap();
+
+    let error = fixture.run(new(&[]), not_opened).unwrap_err();
+    assert!(error.contains("Cargo.toml") && error.contains("--force"));
+    assert!(cache.is_file());
+
+    let cli = Cli::try_parse_from(["cargo-play", "new", "-f"]).unwrap();
+    fixture.run(cli.command, |_| Ok(())).unwrap();
+    assert!(!cache.exists());
+    assert!(fixture.play.join("Cargo.toml").is_file());
+    assert_eq!(fixture.index(), serde_json::json!({}));
+}
+
+#[test]
+fn invalid_manifest_can_be_discarded_only_after_new_project_is_ready() {
+    let fixture = Fixture::previous_trial();
+    fixture.vendor();
+    fs::write(fixture.play.join("Cargo.toml"), "invalid toml").unwrap();
+    let force = |deps: &[&str]| Action::New {
+        deps: deps.iter().map(|dep| (*dep).into()).collect(),
+        force: true,
+    };
+
+    let error = fixture
+        .run(force(&["play-fixture-missing@1"]), not_opened)
+        .unwrap_err();
+    assert!(error.contains("cargo add 失败"), "{error}");
+    assert!(fixture.play.join("old.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(fixture.play.join("Cargo.toml")).unwrap(),
+        "invalid toml"
+    );
+
+    fixture.run(force(&[]), |_| Ok(())).unwrap();
+    assert!(!fixture.play.join("old.txt").exists());
+    assert_eq!(fixture.index(), serde_json::json!({}));
+    assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
+}
+
+#[test]
+fn force_still_archives_a_project_with_a_valid_package_name() {
+    let fixture = Fixture::previous_trial();
+    fixture
+        .run(
+            Action::New {
+                deps: vec![],
+                force: true,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(fixture.archive_at("old-trial").is_file());
+}
+
+#[test]
+fn first_new_discards_legacy_projects_and_other_branches() {
+    let fixture = Fixture::repository();
+    fixture.write_trial();
+    fixture.git(&["branch", "play/new-20260101-000000"]);
+    fixture.run(Action::Init, not_opened).unwrap();
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    assert_eq!(fixture.index(), serde_json::json!({}));
+    assert!(
+        fs::read_dir(fixture.home.join("history"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(!fixture.play.join("old.txt").exists());
+    assert_eq!(
+        fixture.git(&["for-each-ref", "--format=%(refname)", "refs/heads"]),
+        "refs/heads/archive"
+    );
+}
+
+#[test]
+fn package_name_uses_local_time() {
     let instant: Timestamp = "2026-01-01T20:00:00Z".parse().unwrap();
     let local = instant.to_zoned(tz::offset(8).to_time_zone());
-    assert_eq!(default_branch_name(&local), "play/new-20260102-040000");
+    assert_eq!(default_package_name(&local), "play-new-20260102-040000");
 }
 
 #[test]
-fn backs_up_old_project_then_initializes_fresh_trial() {
+fn new_archives_git_history_and_recreates_the_worktree() {
     let fixture = Fixture::previous_trial();
-    let legacy_config = r#"{"template_branch":"missing"}"#;
-    fs::write(fixture.home.join("cargo-play.json"), legacy_config).unwrap();
+    let previous = fixture.git(&["rev-parse", "HEAD"]);
+    // Use a TOML quoted key and literal string to exercise actual TOML parsing.
     fs::write(
-        fixture.play.join("src/main.rs"),
-        "fn main() { println!(\"old\"); }\n",
+        fixture.play.join("Cargo.toml"),
+        MANIFEST.replace("name = \"old-trial\"", "'name' = 'renamed-trial' # comment"),
     )
     .unwrap();
-    fixture.git(&["add", "src/main.rs"]);
-    fs::write(fixture.play.join("note.txt"), "new file").unwrap();
+    fs::write(fixture.play.join(".gitignore"), "/local.env\n").unwrap();
+    fs::write(fixture.play.join("local.env"), "discard").unwrap();
+    fs::write(fixture.play.join("note.txt"), "latest").unwrap();
     fs::remove_file(fixture.play.join("old.txt")).unwrap();
     fs::create_dir(fixture.play.join("target")).unwrap();
-    fs::write(fixture.play.join("target/cache"), "existing build output").unwrap();
+    fs::write(fixture.play.join("target/cache"), "discard").unwrap();
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
 
-    fixture
-        .run(new(&[]), |path| {
-            assert!(path.join("Cargo.toml").is_file());
-            assert!(
-                fs::read_to_string(path.join("src/main.rs"))
-                    .unwrap()
-                    .contains("Hello, world!")
-            );
-            Ok(())
-        })
-        .unwrap();
-    assert!(
-        fixture
-            .git(&["branch", "--show-current"])
-            .starts_with("play/new-")
-    );
-    assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
-    let message = fixture.git(&["log", "-1", "--format=%s", "previous"]);
-    let timestamp = message.strip_prefix("backup: ").unwrap();
-    assert_eq!(timestamp.len(), "2026-01-01T00:00:00Z".len());
+    let entry = &fixture.index()["renamed-trial"];
+    assert_eq!(entry["file"], "renamed-trial.bundle");
+    let timestamp = entry["archived_at"].as_str().unwrap();
     assert_eq!(
         timestamp.parse::<Timestamp>().unwrap().to_string(),
         timestamp
     );
-    let files = fixture.git(&[
-        "diff-tree",
-        "--no-commit-id",
-        "--name-status",
-        "-r",
-        "previous",
-    ]);
-    assert_eq!(files, "A\tnote.txt\nD\told.txt\nM\tsrc/main.rs");
-    assert!(!fixture.play.join("note.txt").exists());
-    assert!(fixture.play.join("target/cache").is_file());
-    assert_eq!(fixture.git(&["status", "--porcelain"]), "");
-    assert_eq!(
-        fs::read_to_string(fixture.home.join("cargo-play.json")).unwrap(),
-        legacy_config
+    let bundle = fixture.archive_at("renamed-trial");
+    fixture.git_at(
+        &fixture.home,
+        &["clone", bundle.to_str().unwrap(), "restored"],
     );
-    let before = fixture.git(&["rev-parse", "HEAD"]);
+    let restored = fixture.home.join("restored");
+    assert_eq!(fixture.git_at(&restored, &["rev-parse", "HEAD^"]), previous);
+    assert!(
+        fixture
+            .git_at(&restored, &["log", "-1", "--format=%s"])
+            .starts_with("backup: ")
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("note.txt")).unwrap(),
+        "latest"
+    );
+    for name in ["old.txt", "local.env", "target"] {
+        assert!(!restored.join(name).exists());
+    }
+    for name in ["old.txt", "local.env", "target", "note.txt"] {
+        assert!(!fixture.play.join(name).exists());
+    }
+    assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
+    let head = fixture.git(&["rev-parse", "HEAD"]);
     fixture.run(Action::Backup, not_opened).unwrap();
-    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), before);
-    fs::write(fixture.play.join("draft.txt"), "latest").unwrap();
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    fs::write(fixture.play.join("draft.txt"), "draft").unwrap();
     fixture.run(Action::Backup, not_opened).unwrap();
-    assert_eq!(fixture.git(&["show", "HEAD:draft.txt"]), "latest");
+    assert_eq!(fixture.git(&["show", "HEAD:draft.txt"]), "draft");
 }
 
 #[test]
-fn refuses_to_remove_tracked_target_content() {
+fn consecutive_new_uses_unique_package_names() {
+    let fixture = Fixture::empty();
+    fixture.with_git(|| {
+        let playground = fixture.playground();
+        for expected in ["same-second", "same-second-2", "same-second-3"] {
+            playground.new_project("same-second", &[], false).unwrap();
+            let manifest = fs::read_to_string(fixture.play.join("Cargo.toml")).unwrap();
+            assert_eq!(
+                toml::from_str::<toml::Value>(&manifest).unwrap()["package"]["name"].as_str(),
+                Some(expected)
+            );
+        }
+    });
+    assert!(fixture.archive_at("same-second").is_file());
+    assert!(fixture.archive_at("same-second-2").is_file());
+}
+
+#[test]
+fn same_package_name_preserves_existing_bundle_and_updates_index() {
+    let fixture = Fixture::previous_trial();
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    let first = fixture.archive_at("old-trial");
+    let bytes = fs::read(&first).unwrap();
+    fs::write(fixture.play.join("Cargo.toml"), MANIFEST).unwrap();
+    fixture.run(new(&[]), |_| Ok(())).unwrap();
+    assert_eq!(fs::read(&first).unwrap(), bytes);
+    assert_eq!(fixture.index()["old-trial"]["file"], "old-trial-2.bundle");
+    assert!(fixture.archive_at("old-trial").is_file());
+}
+
+#[test]
+fn backup_and_new_reject_tracked_target() {
     let fixture = Fixture::previous_trial();
     fs::create_dir(fixture.play.join("target")).unwrap();
     fs::write(fixture.play.join("target/keep.txt"), "keep").unwrap();
@@ -319,35 +470,65 @@ fn refuses_to_remove_tracked_target_content() {
                 .contains("取消跟踪")
         );
     }
-    assert_eq!(fixture.git(&["branch", "--show-current"]), "previous");
-    assert_eq!(
-        fs::read_to_string(fixture.play.join("target/keep.txt")).unwrap(),
-        "keep"
-    );
+    assert!(fixture.play.join("target/keep.txt").is_file());
 }
 
 #[test]
-fn rejects_invalid_configuration_before_backup() {
-    assert!(
-        open_repo(None, false)
-            .map(|_| ())
-            .unwrap_err()
-            .contains("CARGOPLAY_HOME")
-    );
+fn invalid_manifest_and_index_preserve_the_worktree() {
     let fixture = Fixture::previous_trial();
     let head = fixture.git(&["rev-parse", "HEAD"]);
-    fs::write(fixture.play.join("draft.txt"), "not ready").unwrap();
-    for invalid in ["{", "[]"] {
-        fs::write(fixture.home.join("cargo-play.json"), invalid).unwrap();
-        assert!(
-            fixture
-                .run(new(&[]), not_opened)
-                .unwrap_err()
-                .contains("必须是 JSON 对象")
-        );
-    }
-    assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
+    fs::write(
+        fixture.play.join("Cargo.toml"),
+        "[package]\nname = '../unsafe'",
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .run(new(&[]), not_opened)
+            .unwrap_err()
+            .contains("归档文件名")
+    );
+    fs::write(fixture.play.join("Cargo.toml"), "invalid toml").unwrap();
+    assert!(
+        fixture
+            .run(new(&[]), not_opened)
+            .unwrap_err()
+            .contains("[package].name")
+    );
+    fs::write(
+        fixture.play.join("Cargo.toml"),
+        "[package]\nversion = '0.1.0'",
+    )
+    .unwrap();
+    let error = fixture.run(new(&[]), not_opened).unwrap_err();
+    assert!(error.contains("[package].name") && error.contains("--force"));
+    fs::write(fixture.play.join("Cargo.toml"), MANIFEST).unwrap();
+    fs::write(fixture.home.join("history-meta.json"), "[]").unwrap();
+    assert!(
+        fixture
+            .run(new(&[]), not_opened)
+            .unwrap_err()
+            .contains("history-meta.json")
+    );
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert!(fixture.play.join("old.txt").is_file());
+}
+
+#[test]
+fn index_write_failure_removes_only_the_unpublished_archive() {
+    let fixture = Fixture::previous_trial();
+    let mut history = History::open(&fixture.home).unwrap();
+    let index = fixture.home.join("history-meta.json");
+    fs::rename(&index, index.with_extension("original")).unwrap();
+    fs::create_dir(&index).unwrap();
+    let error = history
+        .archive("old-trial", |path| {
+            fs::write(path, "test archive").map_err(|error| error.to_string())
+        })
+        .unwrap_err();
+    assert!(error.contains("写入"), "{error}");
+    assert!(!fixture.home.join("history/old-trial.bundle").exists());
+    assert!(fixture.play.join("old.txt").is_file());
 }
 
 #[test]
@@ -373,29 +554,28 @@ fn checks_git_operations() {
 }
 
 #[test]
-fn branch_suffix_and_worktree_lock() {
+fn locks_mutating_commands_at_home() {
     let fixture = Fixture::previous_trial();
-    let base = "play/20260101-000000Z";
-    fixture.git(&["branch", base]);
-    fixture.git(&["branch", &format!("{base}-2")]);
-    let repo = open_repo(Some(fixture.home.clone().into_os_string()), false).unwrap();
-    assert!(
-        fixture
-            .run(Action::Backup, not_opened)
-            .unwrap_err()
-            .contains("正在使用")
-    );
-    assert_eq!(repo.new_branch(base).unwrap(), format!("{base}-3"));
-    drop(repo);
+    let lock = fixture.playground();
+    for action in [Action::Init, Action::Backup, new(&[])] {
+        assert!(
+            fixture
+                .run(action, not_opened)
+                .unwrap_err()
+                .contains("正在使用")
+        );
+    }
+    drop(lock);
     fixture.run(Action::Backup, not_opened).unwrap();
 }
 
 #[test]
-fn adds_multiple_dependencies_and_records_noop_dependency_commit() {
-    let fixture = Fixture::repository();
+fn adds_multiple_dependencies_and_commits_them() {
+    let fixture = Fixture::empty();
     fixture.vendor();
-    let deps = &["play-fixture-a@1", "play-fixture-b@1"];
-    fixture.run(new(deps), |_| Ok(())).unwrap();
+    fixture
+        .run(new(&["play-fixture-a@1", "play-fixture-b@1"]), |_| Ok(()))
+        .unwrap();
     assert_eq!(
         fixture.git(&["log", "--format=%s"]),
         "deps: add play-fixture-a@1 play-fixture-b@1\ninit: cargo init"
@@ -410,18 +590,10 @@ fn adds_multiple_dependencies_and_records_noop_dependency_commit() {
             .contains("play-fixture-b")
     );
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
-
-    let repo = open_repo(Some(fixture.home.clone().into_os_string()), false).unwrap();
-    repo.add_dependencies(&deps.iter().map(|dep| (*dep).into()).collect::<Vec<_>>())
-        .unwrap();
-    assert_eq!(
-        fixture.git(&["rev-parse", "HEAD^{tree}"]),
-        fixture.git(&["rev-parse", "HEAD^^{tree}"])
-    );
 }
 
 #[test]
-fn failed_backup_stays_on_old_branch() {
+fn failed_backup_preserves_staged_work() {
     let fixture = Fixture::previous_trial();
     fixture.fail_commits();
     fs::write(fixture.play.join("draft.txt"), "keep").unwrap();
@@ -431,54 +603,45 @@ fn failed_backup_stays_on_old_branch() {
             .unwrap_err()
             .contains("备份失败")
     );
-    assert_eq!(fixture.git(&["branch", "--show-current"]), "previous");
     assert_eq!(fixture.git(&["status", "--porcelain"]), "A  draft.txt");
+    assert_eq!(fixture.index(), serde_json::json!({}));
 }
 
 #[test]
-fn cargo_failure_preserves_initialized_branch() {
-    let fixture = Fixture::repository();
+fn bundle_failure_preserves_the_current_project() {
+    let fixture = Fixture::previous_trial();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    fs::write(fixture.play.join(".git/shallow"), format!("{head}\n")).unwrap();
+    assert!(
+        fixture
+            .run(new(&[]), not_opened)
+            .unwrap_err()
+            .contains("浅克隆")
+    );
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fixture.index(), serde_json::json!({}));
+    assert!(fixture.play.join("old.txt").is_file());
+}
+
+#[test]
+fn cargo_failure_preserves_original_project_before_backup() {
+    let fixture = Fixture::previous_trial();
     fixture.vendor();
+    fs::write(fixture.play.join("draft.txt"), "keep").unwrap();
     let error = fixture
         .run(new(&["play-fixture-missing@1"]), not_opened)
         .unwrap_err();
     assert!(error.contains("cargo add 失败"), "{error}");
-    assert!(error.contains("cargo-play backup"));
-    assert!(
-        fixture
-            .git(&["branch", "--show-current"])
-            .starts_with("play/")
-    );
-    assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
-}
-
-#[test]
-fn dependency_commit_failure_preserves_staged_changes() {
-    let fixture = Fixture::repository();
-    fixture.vendor();
-    fixture.run(new(&[]), |_| Ok(())).unwrap();
-    fixture.fail_commits();
-    let repo = open_repo(Some(fixture.home.clone().into_os_string()), false).unwrap();
-    let error = repo
-        .add_dependencies(&["play-fixture-a@1".into()])
-        .unwrap_err();
-    assert!(error.contains("依赖提交失败"), "{error}");
-    assert_eq!(
-        fixture.git(&["status", "--porcelain"]),
-        "A  Cargo.lock\nM  Cargo.toml"
-    );
+    assert_eq!(fixture.git(&["log", "--format=%s"]), "old trial");
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "?? draft.txt");
+    assert_eq!(fixture.index(), serde_json::json!({}));
 }
 
 #[test]
 fn editor_failure_keeps_a_successful_trial() {
-    let fixture = Fixture::repository();
+    let fixture = Fixture::empty();
     fixture
         .run(new(&[]), |_| Err("测试编辑器启动失败".into()))
         .unwrap();
-    assert!(
-        fixture
-            .git(&["branch", "--show-current"])
-            .starts_with("play/")
-    );
     assert_eq!(fixture.git(&["log", "--format=%s"]), "init: cargo init");
 }
