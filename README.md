@@ -1,15 +1,18 @@
 # cargo-play (`cgpl`)
 
-`cgpl` 是一个管理本地 Rust 演练场的命令行工具。想试一个 crate、验证一段代码或复现一个小问题时，可以把项目建在固定的 `play/` 目录。切换演练场时，`cgpl` 会把当前项目归档成 Git Bundle，下次可以按列表序号或 UUID 恢复。
+`cgpl` 是一个管理本地 Rust 演练场的命令行工具。想试一个 crate、验证一段代码或复现一个小问题时，只需在任意终端执行`cgpl new`，
+`cgpl`就会收拾、备份、压缩好上一次演练场的所有内容，准备出一个干净的试验场，并为你打开VSCode。
+
+切换演练场时，`cgpl` 会把当前项目归档成 Git Bundle，下次可以按列表序号或 UUID 恢复。可通过`cgpl list`查看之前的演练场。
 
 ## 安装
 
 从源码构建需要 **Rust 1.89 或更新版本**。运行时需确保 `cargo` 和 `git` 都能从 `PATH` 找到。首次使用 Git 时，请先配置提交身份 `user.name` 和 `user.email`，因为 `cgpl new` 会创建初始提交。
 
-在本仓库根目录执行以下命令。
+在终端中执行以下命令：
 
-```powershell
-cargo install --path . --locked
+```bash
+cargo install --git https://github.com/Fancyflame/cargo-play.git
 cgpl --version
 ```
 
@@ -18,7 +21,7 @@ cgpl --version
 以下命令使用 PowerShell。将 `CGPL_HOME` 指向专门存放演练场的目录。这里设置的环境变量只在当前 PowerShell 会话及其子进程中生效。
 
 ```powershell
-$env:CGPL_HOME = Join-Path $env:USERPROFILE 'cargo-playground'
+$env:CGPL_HOME = 'your/path/to/cargo-playground'
 cgpl init
 cgpl new
 ```
@@ -30,7 +33,7 @@ cargo run --manifest-path (Join-Path $env:CGPL_HOME 'play\Cargo.toml')
 cgpl backup
 ```
 
-在刚初始化的演练场目录里，可以用下面的命令归档并恢复这个演练场。`backup` 可以省略，归档会保存未提交的改动，包括未被 Git 忽略的未跟踪文件。
+在刚初始化的演练场目录里，可以用下面的命令归档后再恢复这个演练场。`backup` 可以省略，归档会保存未提交的改动，包括未被 Git 忽略的未跟踪文件。
 
 ```powershell
 cgpl clear
@@ -49,7 +52,7 @@ cgpl new --name 'Serde demo' --deps serde@1 serde_json
 | 命令 | 用途 |
 | --- | --- |
 | `cgpl init` | 初始化配置、SQLite 数据库、`play/` 和 `history/`。 |
-| `cgpl new [--name <名称>] [-d <依赖>...]` | 归档当前演练场，创建新项目并打开目录。依赖支持 `crate` 或 `crate@版本`。 |
+| `cgpl new [-n <名称>] [-d <依赖>...]` | 归档当前演练场，创建新项目并打开目录。依赖支持 `crate` 或 `crate@版本`。 |
 | `cgpl list [--offset <条数>]` | 按上次访问时间倒序列出演练场，每次最多 50 条。用 `--offset 50` 查看第二页。 |
 | `cgpl open [序号或UUID] [-f]` | 省略目标时直接打开 `play/`。指定目标时归档当前演练场，再切换并打开目标。`-f` 或 `--force` 需要指定目标。打开目录时优先使用 VS Code，其次使用系统默认方式。 |
 | `cgpl backup` | 把当前改动提交到本地 Git 仓库。Git Bundle 在归档时写入。 |
