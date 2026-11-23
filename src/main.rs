@@ -39,7 +39,7 @@ enum Action {
         #[arg(short = 'd', long, value_name = "依赖", num_args = 1..)]
         deps: Vec<String>,
         /// 演练场名称，默认使用生成的 Cargo 包名
-        #[arg(long, value_name = "名称", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        #[arg(short, long, value_name = "名称", value_parser = clap::builder::NonEmptyStringValueParser::new())]
         name: Option<String>,
         /// 允许替换未登记的旧工作区
         #[arg(short, long)]
